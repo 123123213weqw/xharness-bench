@@ -105,6 +105,44 @@ Running many tasks and publishing the favourable subset.
 Report every task, including infrastructure failures, which are classified
 rather than dropped.
 
+## T11 -- Host load is a confound for tasks with timing assertions
+
+Some Terminal-Bench tasks assert *relative performance*, not just correctness.
+`largest-eigenval`'s `test_speedup` is documented as "Make sure new
+implementation is faster than reference" and compares isolated timings; five
+tasks in the suite carry assertions of this kind (`cancel-async-tasks`,
+`largest-eigenval`, `portfolio-optimization`, `query-optimize`, `tune-mjcf`).
+
+Observed directly: running the oracle gate while a parallel image prefetch
+saturated the disk and CPU produced
+
+```
+FAILED ../tests/test_outputs.py::test_speedup[8] - AssertionError: 0.000019 s
+26 passed
+```
+
+-- 26 tests passing and exactly one timing assertion failing, on the reference
+solution, which should score 100%. The task set was fine; the machine was busy.
+
+**Why this is worse than ordinary flakiness.** It is not random. Load is
+*correlated with arm and with run order*: whichever arm happens to run while
+something else is happening on the host collects the failures. In an interleaved
+schedule the damage is spread, but any concurrent work -- a prefetch, a build, a
+second experiment -- biases towards whoever runs during it. A comparison run
+alongside anything else is measuring the host, not the harness.
+
+**Countermeasures.**
+
+1. **Run the gate and the comparison on a quiet host.** This is the real fix.
+   Nothing else heavy runs concurrently, and the prefetch completes first.
+2. **Re-run timing-sensitive failures alone.** The five tasks above are
+   identifiable by inspection, so a failure there under load is re-run rather
+   than counted.
+3. **Never let a load-induced failure enter a pass rate.** It belongs in
+   `harness_error`, and `report.classify` already has that bucket -- but the
+   detection here needs the test name, not just the reward, so it is currently a
+   manual step and is listed as such in `docs/status.md`.
+
 ## Resolution floor
 
 From `report.tasks_required`: detecting a 5-point difference at 80% power needs
