@@ -143,6 +143,58 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T12 -- Measure one thing at a time: bulk transfers starve the verifiers
+
+This is the most expensive mistake made while building this, and it produced a
+completely wrong answer that looked like a real one.
+
+**What happened.** The oracle gate was launched while task images were still
+being pulled. Both paths share one proxy. The result, over 48 tasks:
+
+```
+9 passed / 39 failed  = 18.8%
+```
+
+with 35 of the 39 failures identical: `uvx: command not found`, meaning the
+verifier never managed to download its own toolchain. The very same task set, run
+with the machine otherwise idle, gave **12/13 = 92.3%** and climbing.
+
+**The mechanism**, measured directly rather than reasoned about. With a single
+8 GiB image layer in flight, from the two places that matter:
+
+| Where | Download of the 21 MB uv binary |
+| --- | --- |
+| host, through the proxy | **180 KB in 60 s** (3 KB/s, then timeout) |
+| inside a container, same proxy | 21 MB in 16 s (1.3 MB/s) |
+
+and in the verifier logs, `curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in
+connection to astral.sh:443`. Meanwhile `apt`, which is listed in the daemon's
+`NO_PROXY` and therefore bypasses the proxy, kept working at 985 kB/s inside the
+same containers. So the failure was specific to proxy-routed TLS under saturation,
+not to the network as a whole.
+
+**Why this is a trap rather than an obvious blunder.** Every individual piece
+looked healthy. The proxy node answered its own latency probe in 61 ms. The
+registry mirror responded. DNS resolved. `apt` succeeded. A single `curl` to
+`astral.sh` returned `301`, which reads as success unless you follow the redirect
+to the GitHub asset that actually carries the bytes. Nothing announces "you have
+saturated the link" -- the symptom is that *another* subsystem's TLS handshakes
+get reset, in containers, minutes later.
+
+**Countermeasure, and it is mechanical rather than a matter of care.**
+`scripts/quiet-gate.sh` refuses to start a gate while a `docker pull` is running
+or while the proxy shows more than a handful of active connections. A rule that
+depends on remembering is not a rule. This is the same discipline as T11 -- one
+heavy thing at a time -- but the failure mode is worse: T11 corrupts a few timing
+assertions, T12 corrupts the entire pass rate in a direction that looks like a
+broken task set.
+
+**How it was caught.** Only by the oracle baseline. A harness comparison run in
+that state would have reported a plausible, publishable, entirely false result,
+and no amount of statistical care downstream would have detected it. This is the
+strongest argument in this repository for the oracle gate being load-bearing
+rather than ceremonial.
+
 ## Resolution floor
 
 From `report.tasks_required`: detecting a 5-point difference at 80% power needs
