@@ -66,7 +66,13 @@ from harbor.agents.capabilities import AgentCapabilities
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from ..rpc import ContainerRpcClient, TransportError, exec_parts, message_text, normalized_events
+from ..rpc import (
+    ContainerRpcClient,
+    TransportError,
+    exec_parts,
+    normalized_events,
+    summarize_events,
+)
 
 DEFAULT_REPOSITORY = "123123213weqw/x-harness-rs"
 INSTALL_DIR = "/opt/xharness"
@@ -99,13 +105,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _usage_number(usage: dict[str, Any], *names: str) -> int:
-    """Read a token count that may be camelCase or snake_case."""
-    for name in names:
-        value = usage.get(name)
-        if isinstance(value, (int, float)):
-            return int(value)
-    return 0
 
 
 class XHarnessAgent(BaseAgent):
@@ -456,66 +455,44 @@ class XHarnessAgent(BaseAgent):
         self._transcript = events
         self._populate_context(context, events, time.monotonic() - started)
 
+
     def _populate_context(
         self,
         context: AgentContext,
         events: list[dict[str, Any]],
         elapsed: float,
     ) -> None:
-        # Five non-overlapping dimensions, confirmed against a live host by
-        # feeding a fake provider known numbers: with prompt_tokens=1234 and
-        # cached_tokens=900 the host reported inputTokens=334 (= 1234 - 900),
-        # and with completion_tokens=56 and reasoning_tokens=20 it reported
-        # outputTokens=36 (= 56 - 20). So inputTokens excludes cache reads and
-        # outputTokens excludes reasoning. Summing them is therefore safe, but
-        # dropping reasoning would understate cost, so it is tracked separately.
-        input_tokens = output_tokens = 0
-        cache_read = cache_write = reasoning = 0
-        tool_calls = 0
-        answers: list[str] = []
-        reasons: list[str] = []
+        # Parsing lives in rpc.summarize_events and is shared with the upstream
+        # adapter on purpose. Both emit the same events -- that is what the
+        # replica is for -- so a single implementation means a parsing bug cannot
+        # flatter one arm, which is exactly the failure this comparison has to
+        # defend against. The non-overlap of the token dimensions is verified on
+        # both sides; see the note in rpc.py.
+        summary = summarize_events(events)
 
-        for event in events:
-            kind = event.get("type")
-            data = event.get("data") or {}
-            if kind in ("assistant/message", "message/assistant") and isinstance(data, dict):
-                usage = data.get("usage")
-                if isinstance(usage, dict):
-                    input_tokens += _usage_number(usage, "inputTokens", "input_tokens")
-                    output_tokens += _usage_number(usage, "outputTokens", "output_tokens")
-                    cache_read += _usage_number(usage, "cacheReadTokens", "cache_read_tokens")
-                    cache_write += _usage_number(usage, "cacheWriteTokens", "cache_write_tokens")
-                    reasoning += _usage_number(usage, "reasoningTokens", "reasoning_tokens")
-                answers.append(message_text(data.get("message", data)))
-            elif isinstance(kind, str) and kind.startswith("tool/"):
-                tool_calls += 1
-            elif kind == "turn/end" and isinstance(data, dict):
-                reason = data.get("reason")
-                if isinstance(reason, dict) and isinstance(reason.get("kind"), str):
-                    reasons.append(reason["kind"])
-
-        # Harbor's AgentContext has three token fields, so the full five-way
+        # Harbor's AgentContext has only three token fields; the full five-way
         # split goes into metadata where it survives into the result row.
-        context.n_input_tokens = input_tokens
-        context.n_cache_tokens = cache_read + cache_write
-        context.n_output_tokens = output_tokens
+        context.n_input_tokens = summary["input_tokens"]
+        context.n_cache_tokens = summary["cache_read_tokens"] + summary["cache_write_tokens"]
+        context.n_output_tokens = summary["output_tokens"]
         context.metadata = {
             **(context.metadata or {}),
             "elapsed_sec": round(elapsed, 3),
-            "tool_calls": tool_calls,
-            "turn_end_reasons": reasons,
+            "tool_calls": summary["tool_calls"],
+            "turn_end_reasons": summary["turn_end_reasons"],
             # "completed" is the clean finish; anything else (e.g. "error") means
-            # the harness itself failed and the trial is not evidence about the
-            # model or the task.
-            "turn_completed": "completed" in reasons,
-            "final_response": answers[-1] if answers else "",
+            # the harness itself failed, which is not evidence about the model or
+            # the task.
+            "turn_completed": summary["turn_completed"],
+            "final_response": summary["final_response"],
             "xharness_version": self.version(),
             "xharness_host_sha256": self._bundle.sha256 if self._bundle else None,
             "tokens": {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_read_tokens": cache_read,
-                "cache_write_tokens": cache_write,
-                "reasoning_tokens": reasoning,
+                "input_tokens": summary["input_tokens"],
+                "output_tokens": summary["output_tokens"],
+                "cache_read_tokens": summary["cache_read_tokens"],
+                "cache_write_tokens": summary["cache_write_tokens"],
+                "reasoning_tokens": summary["reasoning_tokens"],
+                "total_tokens_reported": summary["total_tokens_reported"],
             },
         }

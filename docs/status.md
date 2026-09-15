@@ -32,6 +32,21 @@ optimistic.
 | The upstream SDK version matching `dsh-v0.1.0-rc.8` exists on PyPI | the Tier A upstream arm cannot be installed; resolve before running |
 | Terminal-Bench task images reach a package mirror | `setup()` would fail; a task set with vendored dependencies avoids this |
 
+## Both adapters run against the real endpoint with a real credential
+
+Verified by driving the actual adapter classes, not by reading them:
+
+| Arm | Turn | Tools | Token dimensions |
+| --- | --- | --- | --- |
+| XHarness | completed, 4.4 s | 4 | five-way parsed |
+| upstream `dsh` | completed | 4 | five-way parsed |
+
+Both created the file they were asked to create and read it back, so the agents
+are doing work rather than returning text that merely looks plausible.
+
+`tests/smoke_local.py --live` is the reproducible check. It needs a credential in
+`DEEPSEEK_API_KEY` and costs a few hundred tokens.
+
 ## The verifier-network failure is fixed by egress, verified 4/4
 
 Four tasks that had *all* failed with verifier network errors -- with the

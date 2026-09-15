@@ -633,6 +633,96 @@ sometimes hangs" lost to "metered-but-unlimited and 2-9 MB/s". Measured on the
 same images through the unmetered node: one task image that had produced zero
 bytes in eight minutes over a mirror completed in **100 seconds**.
 
+## Both arms emit the same session events, measured
+
+This is the claim the whole Tier A design rests on, so it was checked rather than
+assumed. Driving upstream `dsh` through its Python SDK and XHarness through its
+loopback RPC, on the same model and similar prompts, produced the **same event
+types for a turn**:
+
+```
+turn/start, step/start, system/message, user/message, request/header,
+request/context, session/title, assistant/message, step/end, turn/end
+```
+
+with the same nesting, `{"type": ..., "seq": ..., "time": ..., "data": {...}}`,
+and the same completion signal: `turn/end` with `reason.kind == "completed"`.
+Upstream also exposes `finish_reason == "completed"` on its `RunResult`.
+
+**Consequence.** `rpc.summarize_events` is shared by both adapters on purpose. A
+single implementation means a parsing difference cannot masquerade as a harness
+difference -- which is precisely the failure mode a replica comparison has to
+defend against, and one that would be invisible in the final table.
+
+## Token accounting is comparable across the two arms, and the dimensions do not overlap
+
+An open question in the original design was whether token figures from two
+independent implementations could be compared at all. They can, and the field
+names match exactly:
+
+| | inputTokens | outputTokens | cacheReadTokens | cacheWriteTokens | reasoningTokens | totalTokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| XHarness (fake provider: prompt=1234, cached=900, completion=56, reasoning=20) | 334 | 36 | 900 | 0 | 20 | — |
+| upstream `dsh` (real turn) | 6735 | 136 | 14976 | 0 | 2 | 21847 |
+
+Two independent checks of the same invariant:
+
+- XHarness: `1234 - 900 = 334` and `56 - 20 = 36`, so `inputTokens` excludes
+  cache reads and `outputTokens` excludes reasoning.
+- upstream: `6735 + 14976 + 136 = 21847`, exactly the reported `totalTokens`.
+
+So **summing the five dimensions is safe, and dropping `reasoningTokens`
+understates cost.** That matters because the bench's selling point is comparing
+cost as well as pass rate; getting this wrong would have silently favoured
+whichever arm reasons more.
+
+## The upstream SDK is pre-release only, and has no PyPI release for the frozen tag
+
+Two traps, both of which read like something else.
+
+**Every published version is a pre-release.** `pip install deepseek-harness-sdk`
+fails with `No matching distribution found`, which looks like a typo or a
+delisted package. It needs `--pre`. The `setup()` in the upstream adapter now
+passes it.
+
+**The frozen tag is not on PyPI.** The replica tracks
+`deepseek-harness@141eb6fef8`, which is GitHub tag `dsh-v0.1.0-rc.8` -- verified
+present. But the PyPI 0.1.0 series stops at **`0.1.0rc7`**: there is no `rc8`
+wheel. So the closest installable upstream is **one release candidate below the
+frozen revision**, and that drift is recorded in every result row
+(`sdk_version`, `frozen_tag`, `sdk_version_is_frozen_tag: false`) rather than
+smoothed over. Reporting it as an exact match would have turned a fidelity
+measurement into a measurement of upstream progress.
+
+Available installable versions: `0.1.0rc6`, `0.1.0rc7`, `0.1.1rc1`, `0.1.2rc1`,
+`0.1.2a3`, `0.1.5rc1` (latest). Native wheels are published for
+`manylinux_2_28_x86_64`, `manylinux_2_28_aarch64`, `macosx_14_0_arm64` and, from
+0.1.2rc1, `win_amd64`.
+
+## Credentials: one file outside the repository
+
+Both adapters read the credential from the environment, and neither needs a
+different variable: `XHarnessAgent` prefers `XHARNESS_API_KEY` and falls back to
+`DEEPSEEK_API_KEY`; `DshUpstreamAgent` prefers `DEEPSEEK_API_KEY`. Setting the
+latter covers both.
+
+The file lives at `~/.config/xharness-bench/credentials.env` with mode 0600, and
+**outside the repository**, so no `.gitignore` rule is load-bearing and a stray
+`git add -A` cannot leak it. `scripts/with-credentials.sh` sources it and execs a
+command, which keeps secrets off every command line -- `ps` shows arguments to
+every process on the host, and shell history keeps them too.
+
+Verified live, on the real endpoint, by running the actual adapter classes:
+
+| Adapter | Result |
+| --- | --- |
+| `XHarnessAgent` | turn completed in 4.4 s, 4 tool calls, wrote the file, read it back |
+| `DshUpstreamAgent` (via the SDK it drives) | turn completed, 4 tool calls, wrote the file, five token dimensions parsed |
+
+`tests/smoke_local.py --live` is that check. The default fake-provider mode
+asserts exact numbers and needs no credential; `--live` proves the credential path
+and the real streaming protocol, which a fake provider cannot.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command

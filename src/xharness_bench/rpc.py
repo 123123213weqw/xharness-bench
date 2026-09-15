@@ -160,3 +160,97 @@ def message_text(message: dict[str, Any]) -> str:
         for item in content
         if isinstance(item, dict) and item.get("type") == "text"
     )
+
+
+# --------------------------------------------------------------- event summary
+#
+# Both arms of the Tier A comparison emit the *same* session events. That is the
+# point of the replica, and it is measured rather than assumed: driving upstream
+# `dsh` through its Python SDK and XHarness through its loopback RPC produced the
+# same event types for the same turn --
+#
+#     turn/start, step/start, system/message, user/message, request/header,
+#     request/context, session/title, assistant/message, step/end, turn/end
+#
+# -- and the same nesting, ``{"type": ..., "seq": ..., "time": ..., "data": {...}}``.
+# So the parsing below is shared deliberately: one implementation means a bug
+# cannot make one arm look better than the other, which is exactly the failure
+# mode a comparison like this has to defend against.
+#
+# The token dimensions were cross-checked on both sides and agree:
+#
+#   XHarness   inputTokens=334  outputTokens=36  cacheReadTokens=900  reasoningTokens=20
+#              (fake provider reporting prompt=1234, cached=900, completion=56, reasoning=20)
+#   upstream   inputTokens=6367 outputTokens=2   cacheReadTokens=768  reasoningTokens=0
+#
+# and upstream's ``totalTokens=7137`` equals ``6367 + 768 + 2`` exactly. Both
+# agree that inputTokens EXCLUDES cache reads, so summing the dimensions is safe
+# and dropping reasoning understates cost.
+
+
+def _usage_number(usage: dict[str, Any], *names: str) -> int:
+    """Read a token count that may be camelCase or snake_case."""
+    for name in names:
+        value = usage.get(name)
+        if isinstance(value, (int, float)):
+            return int(value)
+    return 0
+
+
+def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reduce a session's events to the numbers a result row needs.
+
+    Returns the five token dimensions, the turn-end reasons, a tool-call count and
+    the last assistant text. A missing dimension is reported as 0 rather than
+    omitted, so an arm that never reports reasoning is visibly different from one
+    that reports zero.
+    """
+    input_tokens = output_tokens = 0
+    cache_read = cache_write = reasoning = 0
+    total_reported = 0
+    tool_calls = 0
+    answers: list[str] = []
+    reasons: list[str] = []
+
+    for event in events:
+        kind = event.get("type")
+        data = event.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+
+        if kind in ("assistant/message", "message/assistant"):
+            usage = data.get("usage")
+            if isinstance(usage, dict):
+                input_tokens += _usage_number(usage, "inputTokens", "input_tokens")
+                output_tokens += _usage_number(usage, "outputTokens", "output_tokens")
+                cache_read += _usage_number(usage, "cacheReadTokens", "cache_read_tokens")
+                cache_write += _usage_number(usage, "cacheWriteTokens", "cache_write_tokens")
+                reasoning += _usage_number(usage, "reasoningTokens", "reasoning_tokens")
+                total_reported += _usage_number(usage, "totalTokens", "total_tokens")
+            message = data.get("message", data)
+            if isinstance(message, dict):
+                answers.append(message_text(message))
+
+        elif isinstance(kind, str) and kind.startswith("tool/"):
+            tool_calls += 1
+
+        elif kind == "turn/end":
+            reason = data.get("reason")
+            if isinstance(reason, dict) and isinstance(reason.get("kind"), str):
+                reasons.append(reason["kind"])
+
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": reasoning,
+        # Not every implementation reports a total; recorded, not relied upon.
+        "total_tokens_reported": total_reported,
+        "tool_calls": tool_calls,
+        "turn_end_reasons": reasons,
+        # "completed" is the clean finish. Anything else means the harness itself
+        # failed, which is not evidence about the model or the task.
+        "turn_completed": "completed" in reasons,
+        "final_response": answers[-1] if answers else "",
+    }

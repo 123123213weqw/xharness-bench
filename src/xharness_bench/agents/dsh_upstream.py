@@ -45,10 +45,21 @@ from harbor.agents.capabilities import AgentCapabilities
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
-from ..rpc import exec_parts
+from ..rpc import exec_parts, summarize_events
 
-FROZEN_UPSTREAM_TAG = "dsh-v0.1.0-rc.8"
 FROZEN_CONTRACT_REVISION = "deepseek-harness@141eb6fef8"
+FROZEN_UPSTREAM_TAG = "dsh-v0.1.0-rc.8"
+
+# The tag above is what the replica froze against, and it exists on GitHub. It
+# does NOT exist on PyPI: the 0.1.0 series there stops at ``0.1.0rc7``. So the
+# closest installable upstream is one release candidate below the frozen
+# revision, and that drift has to be stated rather than papered over -- it is the
+# difference between measuring replica fidelity and measuring upstream progress.
+#
+# Every PyPI release of this SDK is a pre-release (rc/a/dev), so ``pip install``
+# needs ``--pre``; without it pip reports "No matching distribution found", which
+# reads like a typo rather than a flag omission.
+NEAREST_INSTALLABLE_TO_FROZEN = "0.1.0rc7"
 
 DRIVER = textwrap.dedent(
     '''
@@ -68,11 +79,14 @@ DRIVER = textwrap.dedent(
             **({"max_tokens": payload["max_tokens"]} if payload.get("max_tokens") else {}),
         ) as harness:
             run = harness.run(payload["instruction"], session_id="bench-trial")
+        # RunResult exposes events and finish_reason, not usage. The token
+        # figures live inside the assistant/message event, which is the same
+        # place XHarness puts them -- so the shared parser reads both.
         result = {
             "ok": True,
             "final_response": run.final_response,
-            "usage": getattr(run, "usage", None),
-            "raw": {k: str(v) for k, v in vars(run).items()} if hasattr(run, "__dict__") else None,
+            "finish_reason": getattr(run, "finish_reason", None),
+            "events": [e for e in (getattr(run, "events", None) or []) if isinstance(e, dict)],
         }
     except Exception as error:
         result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
@@ -122,8 +136,8 @@ class DshUpstreamAgent(BaseAgent):
     @override
     async def setup(self, environment: BaseEnvironment) -> None:
         spec = "deepseek-harness-sdk"
-        if self._sdk_version:
-            spec = f"{spec}=={self._sdk_version}"
+        version = self._sdk_version or NEAREST_INSTALLABLE_TO_FROZEN
+        spec = f"{spec}=={version}"
         code, out = await self._exec(
             environment,
             "command -v python3 >/dev/null 2>&1 || "
@@ -131,7 +145,9 @@ class DshUpstreamAgent(BaseAgent):
             "python3 python3-venv python3-pip) >/dev/null 2>&1; "
             "python3 -m venv /opt/dsh-venv >/dev/null 2>&1; "
             f"/opt/dsh-venv/bin/pip install --quiet --upgrade pip >/dev/null 2>&1; "
-            f"/opt/dsh-venv/bin/pip install --quiet {shlex.quote(spec)} 2>&1 | tail -5; "
+            # --pre is mandatory: every published version of this SDK is a
+            # pre-release, and pip hides those by default.
+            f"/opt/dsh-venv/bin/pip install --quiet --pre {shlex.quote(spec)} 2>&1 | tail -5; "
             "/opt/dsh-venv/bin/python -c 'import deepseek_harness, sys; "
             "print(deepseek_harness.__file__)'",
             timeout_sec=1800,
@@ -203,21 +219,36 @@ class DshUpstreamAgent(BaseAgent):
                 except json.JSONDecodeError:
                     continue
 
-        usage = result.get("usage") or {}
-        if isinstance(usage, dict):
-            context.n_input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
-            context.n_output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
-            context.n_cache_tokens = int(
-                usage.get("cache_read_tokens") or usage.get("cached_tokens") or 0
-            )
+        # Same parser as the XHarness adapter: the two emit identical events, so
+        # sharing the implementation keeps a parsing difference from masquerading
+        # as a harness difference.
+        summary = summarize_events(result.get("events") or [])
+
+        context.n_input_tokens = summary["input_tokens"]
+        context.n_cache_tokens = summary["cache_read_tokens"] + summary["cache_write_tokens"]
+        context.n_output_tokens = summary["output_tokens"]
         context.metadata = {
             **(context.metadata or {}),
             "elapsed_sec": result.get("elapsed_sec"),
-            "final_response": result.get("final_response", ""),
+            "final_response": result.get("final_response") or summary["final_response"],
             "turn_ok": result.get("ok"),
             "turn_error": result.get("error"),
-            "upstream_tag": FROZEN_UPSTREAM_TAG,
+            "finish_reason": result.get("finish_reason"),
+            "turn_end_reasons": summary["turn_end_reasons"],
+            "turn_completed": summary["turn_completed"],
+            "tool_calls": summary["tool_calls"],
+            # Recorded so a result row always says which upstream it measured.
             "contract_revision": FROZEN_CONTRACT_REVISION,
-            "sdk_version": self._sdk_version,
+            "frozen_tag": FROZEN_UPSTREAM_TAG,
+            "sdk_version": self._sdk_version or NEAREST_INSTALLABLE_TO_FROZEN,
+            "sdk_version_is_frozen_tag": False,
             "exit_code": code,
+            "tokens": {
+                "input_tokens": summary["input_tokens"],
+                "output_tokens": summary["output_tokens"],
+                "cache_read_tokens": summary["cache_read_tokens"],
+                "cache_write_tokens": summary["cache_write_tokens"],
+                "reasoning_tokens": summary["reasoning_tokens"],
+                "total_tokens_reported": summary["total_tokens_reported"],
+            },
         }

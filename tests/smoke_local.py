@@ -24,6 +24,11 @@ accepted; ``turn/end`` arrives; and the five token dimensions are parsed.
 Does not prove: anything about a real model's answers, or that a Terminal-Bench
 task can be solved. Those need the benchmark itself.
 
+Pass ``--live`` to skip the fake provider and drive a real model instead. That
+is a different and stronger check: it exercises the credential path, the real
+endpoint and the real streaming protocol, at the cost of a few hundred tokens. A
+fake provider cannot tell you whether the harness is wired to a working key.
+
 Usage::
 
     python tests/smoke_local.py --host-binary ~/xharness/bin/xharness-host \\
@@ -163,6 +168,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--version", default="0.2.19")
     parser.add_argument("--port", type=int, default=8123)
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="drive a real model instead of the fake provider (costs tokens)",
+    )
+    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--base-url", default="https://api.deepseek.com")
+    parser.add_argument(
+        "--api-key-env",
+        default="DEEPSEEK_API_KEY",
+        help="environment variable holding the credential, for --live",
+    )
     args = parser.parse_args(argv)
 
     root = Path(tempfile.mkdtemp(prefix="xh-smoke-"))
@@ -186,19 +203,29 @@ def main(argv: list[str] | None = None) -> int:
     else:
         (target / "web").mkdir(exist_ok=True)
 
-    provider = FakeProvider(args.port)
-    provider.start()
-    os.environ["XHARNESS_API_KEY"] = "sk-smoke-test"
+    live = bool(args.live)
+    provider = None
+    if not live:
+        provider = FakeProvider(args.port)
+        provider.start()
+        os.environ["XHARNESS_API_KEY"] = "sk-smoke-test"
+    else:
+        key = os.environ.get(args.api_key_env, "")
+        if not key.startswith("sk-"):
+            print(f"  {args.api_key_env} is not set (or does not look like a key)")
+            return 2
+        print(f"  live mode: {args.model} at {args.base_url}")
+        print(f"  credential: {args.api_key_env} ({len(key)} chars, {key[:3]}...)")
 
     async def scenario() -> dict[str, Any]:
         from harbor.models.agent.context import AgentContext
 
         agent = X.XHarnessAgent(
             logs_dir=root / "logs",
-            model_name="deepseek-v4-flash",
+            model_name=args.model,
             version=args.version,
             cache_dir=str(cache),
-            base_url=f"http://127.0.0.1:{args.port}/v1",
+            base_url=(args.base_url if live else f"http://127.0.0.1:{args.port}/v1"),
             context_window=65536,
             turn_timeout_sec=120,
         )
@@ -211,26 +238,42 @@ def main(argv: list[str] | None = None) -> int:
     try:
         context = asyncio.run(scenario())
     finally:
-        provider.stop()
+        if provider is not None:
+            provider.stop()
 
     meta = context.metadata or {}
     tokens = meta.get("tokens") or {}
-    checks = [
-        ("turn reached a clean finish", meta.get("turn_completed") is True),
-        ("turn/end reason recorded", meta.get("turn_end_reasons") == ["completed"]),
-        ("final response captured", bool(meta.get("final_response"))),
-        (f"inputTokens == {EXPECT_INPUT}", tokens.get("input_tokens") == EXPECT_INPUT),
-        (f"outputTokens == {EXPECT_OUTPUT}", tokens.get("output_tokens") == EXPECT_OUTPUT),
-        (f"cacheReadTokens == {CACHED_TOKENS}", tokens.get("cache_read_tokens") == CACHED_TOKENS),
-        (f"reasoningTokens == {REASONING_TOKENS}", tokens.get("reasoning_tokens") == REASONING_TOKENS),
-        ("Harbor context populated", context.n_input_tokens == EXPECT_INPUT
-         and context.n_output_tokens == EXPECT_OUTPUT),
-        ("token-count route was used", any("input_tokens" in p for p in provider.paths)),
-        ("chat route was used", any(p.endswith("/chat/completions") for p in provider.paths)),
-    ]
+    if live:
+        # The fake provider asserts exact numbers; with a real model the point is
+        # that the plumbing works and the figures are plausible.
+        checks = [
+            ("turn reached a clean finish", meta.get("turn_completed") is True),
+            ("turn/end reason recorded", meta.get("turn_end_reasons") == ["completed"]),
+            ("final response captured", bool(meta.get("final_response"))),
+            ("input tokens reported", (tokens.get("input_tokens") or 0) > 0),
+            ("output tokens reported", (tokens.get("output_tokens") or 0) > 0),
+            ("Harbor context populated", (context.n_input_tokens or 0) > 0),
+            ("tool_calls counter present", "tool_calls" in meta),
+        ]
+        print(f"provider paths seen: (live, not instrumented)")
+    else:
+        checks = [
+            ("turn reached a clean finish", meta.get("turn_completed") is True),
+            ("turn/end reason recorded", meta.get("turn_end_reasons") == ["completed"]),
+            ("final response captured", bool(meta.get("final_response"))),
+            (f"inputTokens == {EXPECT_INPUT}", tokens.get("input_tokens") == EXPECT_INPUT),
+            (f"outputTokens == {EXPECT_OUTPUT}", tokens.get("output_tokens") == EXPECT_OUTPUT),
+            (f"cacheReadTokens == {CACHED_TOKENS}", tokens.get("cache_read_tokens") == CACHED_TOKENS),
+            (f"reasoningTokens == {REASONING_TOKENS}", tokens.get("reasoning_tokens") == REASONING_TOKENS),
+            ("Harbor context populated", context.n_input_tokens == EXPECT_INPUT
+             and context.n_output_tokens == EXPECT_OUTPUT),
+            ("token-count route was used", any("input_tokens" in p for p in provider.paths)),
+            ("chat route was used", any(p.endswith("/chat/completions") for p in provider.paths)),
+        ]
 
     print(f"workspace: {workspace}")
-    print(f"provider paths seen: {provider.paths}")
+    if provider is not None:
+        print(f"provider paths seen: {provider.paths}")
     print(f"metadata: {json.dumps(meta, ensure_ascii=False)[:400]}")
     print()
     failed = 0
