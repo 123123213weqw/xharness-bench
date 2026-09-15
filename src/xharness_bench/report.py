@@ -192,9 +192,27 @@ def compare(rows: Iterable[dict[str, Any]], baseline: str, candidate: str) -> Co
     return result
 
 # --------------------------------------------------------------------- loading
+#
+# Field paths below were read off real Harbor 0.23.0 output, not guessed. A
+# single trial's ``result.json`` looks like:
+#
+#   {"task_name": "break-filter-js-from-html",
+#    "task_id": {"git_url": ..., "path": "break-filter-js-from-html", ...},
+#    "agent_info": {"name": "oracle", "version": "1.0.0"},
+#    "agent_result": {"n_input_tokens": null, ...},
+#    "verifier_result": {"rewards": {"reward": 1.0}},
+#    "exception_info": null}
+#
+# Two traps this handles explicitly. ``rewards`` is a *dict* (tasks may score on
+# several keys), not a number. And ``task_id`` is a dict, so treating it as the
+# task name yields a row whose task_id is a dict -- which then silently fails to
+# pair with anything. Both would have produced a confidently wrong table rather
+# than an error, which is why ``--inspect`` exists.
 
 
-def _first(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+def _first(mapping: Any, *keys: str, default: Any = None) -> Any:
+    if not isinstance(mapping, dict):
+        return default
     for key in keys:
         if key in mapping and mapping[key] is not None:
             return mapping[key]
@@ -210,106 +228,129 @@ def _dig(mapping: Any, *path: str) -> Any:
     return cursor
 
 
+def _reward_of(trial: dict[str, Any]) -> float | None:
+    """The scalar reward, from wherever this Harbor version puts it."""
+    rewards = _dig(trial, "verifier_result", "rewards")
+    if isinstance(rewards, dict):
+        for key in ("reward", "score", "resolved"):
+            if isinstance(rewards.get(key), (int, float)):
+                return float(rewards[key])
+        numbers = [v for v in rewards.values() if isinstance(v, (int, float))]
+        if numbers:
+            return float(numbers[0])
+    for candidate in (
+        trial.get("reward"),
+        trial.get("score"),
+        _dig(trial, "verifier_result", "reward"),
+        _dig(trial, "result", "reward"),
+    ):
+        if isinstance(candidate, (int, float)):
+            return float(candidate)
+    return None
+
+
+def _task_of(trial: dict[str, Any]) -> str | None:
+    name = _first(trial, "task_name", "trial_name", "name")
+    if isinstance(name, str):
+        return name
+    task_id = trial.get("task_id")
+    if isinstance(task_id, str):
+        return task_id
+    path = _dig(task_id, "path")
+    if isinstance(path, str):
+        return path
+    return None
+
+
+def _harness_of(trial: dict[str, Any], fallback: str) -> str:
+    for candidate in (
+        _dig(trial, "agent_info", "name"),
+        _dig(trial, "config", "agent", "name"),
+        _first(trial, "agent_name", "agent", "harness"),
+    ):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+        if isinstance(candidate, dict):
+            inner = _first(candidate, "name", "import_path")
+            if isinstance(inner, str) and inner:
+                return inner
+    return fallback
+
+
 def row_from_trial(
     trial: dict[str, Any], task_id: str, harness: str, source: str
 ) -> dict[str, Any] | None:
-    """Map one Harbor trial record onto this repository's flat result row.
+    """Map one Harbor trial onto this repository's flat result row.
 
-    Harbor's on-disk schema is not part of its public contract, so every field is
-    read through a list of candidate paths, and a missing reward is treated as
-    "no result" rather than as a failure. Inferring *failure* from an absent
-    field would silently invent losses, which is the one error that would corrupt
-    the comparison.
+    A missing reward yields ``None`` -- "no result" -- never a failure. Inferring
+    a loss from an absent field would invent data, which is the one error that
+    would corrupt a paired comparison; a missing row is at least visible as an
+    unpaired task.
     """
-    reward = _first(
-        trial, "reward", "score", default=_dig(trial, "verifier_result", "reward")
-    )
-    if reward is None:
-        reward = _dig(trial, "result", "reward")
+    reward = _reward_of(trial)
     if reward is None:
         return None
 
-    agent_result = (
-        trial.get("agent_result") if isinstance(trial.get("agent_result"), dict) else {}
-    )
+    agent_result = trial.get("agent_result") if isinstance(trial.get("agent_result"), dict) else {}
     metadata = {
         "timeout": bool(_first(trial, "timeout", default=False)),
         "final_response": _first(agent_result, "final_response", "output", default=""),
         "turn_end_reasons": _first(agent_result, "turn_end_reasons", default=[]),
-        "elapsed_sec": _first(
-            agent_result, "elapsed_sec", default=_first(trial, "elapsed_sec")
-        ),
+        "elapsed_sec": _first(agent_result, "elapsed_sec", default=_first(trial, "elapsed_sec")),
         "tool_calls": _first(agent_result, "tool_calls"),
         "xharness_version": _first(agent_result, "xharness_version"),
         "xharness_host_sha256": _first(agent_result, "xharness_host_sha256"),
     }
+    exception = trial.get("exception_info")
+    metadata["exception"] = str(exception)[:400] if exception else None
 
     return {
         "task_id": task_id,
         "harness": harness,
-        "passed": float(reward) >= 1.0,
-        "reward": float(reward),
-        "n_input_tokens": int(
-            _first(trial, "n_input_tokens", default=_dig(trial, "metrics", "n_input_tokens")) or 0
-        ),
-        "n_output_tokens": int(
-            _first(trial, "n_output_tokens", default=_dig(trial, "metrics", "n_output_tokens")) or 0
-        ),
-        "n_cache_tokens": int(
-            _first(trial, "n_cache_tokens", default=_dig(trial, "metrics", "n_cache_tokens")) or 0
-        ),
-        "cost_usd": _first(trial, "cost_usd", default=_dig(trial, "metrics", "cost_usd")),
-        "wall_clock_sec": _first(
-            trial, "wall_clock_sec", default=_dig(trial, "metrics", "wall_clock_sec")
-        ),
+        "passed": reward >= 1.0,
+        "reward": reward,
+        "n_input_tokens": int(_first(agent_result, "n_input_tokens", default=0) or 0),
+        "n_output_tokens": int(_first(agent_result, "n_output_tokens", default=0) or 0),
+        "n_cache_tokens": int(_first(agent_result, "n_cache_tokens", default=0) or 0),
+        "cost_usd": _first(agent_result, "cost_usd"),
+        "wall_clock_sec": _first(trial, "wall_clock_sec"),
         "metadata": {k: v for k, v in metadata.items() if v is not None},
-        "error": _first(trial, "error", "exception_info", default=None),
+        "error": exception,
         "source": source,
     }
 
 
 def load_harbor_jobs(root: Path) -> list[dict[str, Any]]:
-    """Read every Harbor job directory under ``root`` into flat rows.
+    """Read every Harbor trial under ``root`` into flat rows.
 
-    Layout-agnostic: any JSON payload carrying per-trial results is considered,
-    so a Harbor schema change degrades to an empty parse (loud, via --inspect)
-    rather than to a confidently wrong number.
+    Scans for ``result.json`` by name, which is where Harbor puts the trial
+    record, and stays tolerant of the surrounding layout.
     """
     rows: list[dict[str, Any]] = []
-    for path in sorted(root.glob("**/*.json")):
+    for path in sorted(root.glob("**/result.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
 
-        # Shape 1: {"results": [{"task_id": ..., "reward": ...}, ...]}
-        results = payload.get("results") if isinstance(payload, dict) else None
-        if isinstance(results, list):
-            for entry in results:
-                if not isinstance(entry, dict):
-                    continue
-                row = _row_from_entry(entry, path)
-                if row:
-                    rows.append(row)
+        entries: list[dict[str, Any]] = []
+        if isinstance(payload, dict):
+            results = payload.get("results")
+            if isinstance(results, list):
+                entries = [e for e in results if isinstance(e, dict)]
+            elif any(k in payload for k in ("verifier_result", "reward", "task_name")):
+                entries = [payload]
 
-        # Shape 2: a single trial record per file.
-        elif isinstance(payload, dict) and any(
-            key in payload for key in ("reward", "verifier_result", "trial_name")
-        ):
-            row = _row_from_entry(payload, path)
+        for entry in entries:
+            task_id = _task_of(entry)
+            if not task_id:
+                continue
+            row = row_from_trial(
+                entry, task_id, _harness_of(entry, path.parent.name), str(path)
+            )
             if row:
                 rows.append(row)
     return rows
-
-
-def _row_from_entry(entry: dict[str, Any], path: Path) -> dict[str, Any] | None:
-    task_id = _first(entry, "task_id", "taskId", "task_name", "trial_name", "name")
-    harness = _first(entry, "agent_name", "agent", "harness", default=path.parent.name)
-    if isinstance(harness, dict):
-        harness = _first(harness, "name", "import_path", default=path.parent.name)
-    if not isinstance(task_id, str) or not isinstance(harness, str):
-        return None
-    return row_from_trial(entry, task_id, harness, str(path))
 
 
 # ------------------------------------------------------------------------ CLI
@@ -414,8 +455,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     rows = load_harbor_jobs(args.results)
-    if not rows:
-        rows = load_results(args.results)
 
     if args.json:
         print(json.dumps(rows, indent=2, ensure_ascii=False))

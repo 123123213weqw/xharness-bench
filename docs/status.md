@@ -34,6 +34,12 @@ optimistic.
 
 ## The oracle gate has been exercised, and it failed
 
+Quantified on a full run over the published task images: **4 passed, 4 failed, of
+which 3 failed to a verifier network error**, with the reference solution
+applied. The floor should be ~100%. The details, the two designs that were
+tested, and why `--from-prebuilt` is the correct one are in
+`docs/findings.md`.
+
 Running the `oracle` baseline is not a formality here. On the first real attempt
 the reference solution scored **1/5**, both failures being verifier-side network
 errors before any test ran. That is the gate doing its job: the task set is not
