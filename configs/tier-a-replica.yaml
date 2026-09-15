@@ -1,0 +1,52 @@
+# Tier A -- replica fidelity.
+#
+# Both arms speak the same control plane, so the prompt components and tool
+# surface are held constant by construction and the implementation is the only
+# free variable. This is the experiment that cannot be run for any other pair of
+# harnesses.
+name: tier-a-replica
+dataset: terminal-bench@2.0
+
+pinned:
+  model: deepseek/deepseek-v4-flash
+  # The replica's frozen contract revision. Comparing against a different
+  # upstream version would measure upstream drift rather than replica fidelity.
+  upstream_tag: dsh-v0.1.0-rc.8
+  contract_revision: deepseek-harness@141eb6fef8
+  xharness_version: "0.2.19"
+  max_output_tokens: 8192
+  turn_timeout_sec: 1800
+
+# Mandatory. Without these three the pass rates cannot be attributed to anything.
+baselines:
+  - agent: oracle          # proves the tasks and verifiers are sound
+  - agent: nop             # proves the verifier fails an empty agent
+  - agent: mini-swe-agent  # the naive bash loop
+
+arms:
+  - name: xharness
+    agent: xharness_bench.agents.xharness:XHarnessAgent
+    kwargs:
+      version: "0.2.19"
+      provider: deepseek
+      base_url: https://api.deepseek.com
+  - name: dsh-upstream
+    agent: xharness_bench.agents.dsh_upstream:DshUpstreamAgent
+    kwargs:
+      provider: deepseek-official
+      # Must correspond to dsh-v0.1.0-rc.8; resolved at run time and recorded.
+      sdk_version: null
+
+execution:
+  n_concurrent: 4          # host has 16 threads / 11 GB; containers are small
+  # Interleave A,B,A,B rather than A,A,...,B,B. Provider latency and silent model
+  # updates drift over hours, and blocked ordering turns that drift into a fake
+  # treatment effect.
+  order: interleaved
+  repeats: 1               # tasks are the unit; prefer more tasks over more repeats
+
+comparison:
+  baseline: dsh-upstream
+  candidate: xharness
+  test: mcnemar_exact
+  alpha: 0.05

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xharness-bench"
+version = "0.1.0"
+description = "Controlled harness comparison on Terminal-Bench: XHarness vs its upstream vs commercial agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["harbor>=0.23"]
+
+[project.optional-dependencies]
+analysis = ["numpy>=1.26", "scipy>=1.11", "pandas>=2.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xharness_bench"]

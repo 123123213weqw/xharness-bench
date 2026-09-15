@@ -1,0 +1,47 @@
+# Tier B -- cross-harness capability.
+#
+# Here the system prompt and tool surface differ between arms and are part of
+# the treatment. Only externally verified pass/fail is comparable.
+name: tier-b-harnesses
+dataset: terminal-bench@2.0
+
+pinned:
+  model: deepseek/deepseek-v4-flash   # one model across every arm, no exceptions
+
+baselines:
+  - agent: oracle
+  - agent: nop
+
+arms:
+  - name: xharness
+    agent: xharness_bench.agents.xharness:XHarnessAgent
+  - name: dsh-upstream
+    agent: xharness_bench.agents.dsh_upstream:DshUpstreamAgent
+  - name: mini-swe-agent           # naive loop; the bar sophistication must clear
+    agent: mini-swe-agent
+  - name: openhands
+    agent: openhands
+  - name: claude-code
+    agent: claude-code
+    # Only usable if the arm is pointed at the same model as every other arm.
+    # If it can only run Anthropic models, it belongs in a separate,
+    # clearly-labelled non-comparable section -- not in this table.
+    requires_same_model: true
+  - name: codex
+    agent: codex
+    requires_same_model: true
+
+execution:
+  n_concurrent: 4
+  order: interleaved
+  repeats: 1
+
+reporting:
+  primary: verified_pass_rate
+  # Recorded for every arm, compared across arms only for the Tier A pair.
+  secondary: [input_tokens, output_tokens, cache_tokens, cost_usd, wall_clock_sec]
+  # A harness that wins by spending 4x the tokens has not obviously won.
+  always_report: [tokens_per_solved_task, cost_per_solved_task]
+  warnings:
+    - "token accounting is not comparable across vendors; do not rank on it"
+    - "differences below ~8 points are below this suite's resolution"
