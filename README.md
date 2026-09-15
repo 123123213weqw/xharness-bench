@@ -122,6 +122,40 @@ Aggregate:
 python -m xharness_bench.report --results runs/ --baseline dsh-upstream --candidate xharness
 ```
 
+## Making the run possible: bake the verifiers' dependencies
+
+Terminal-Bench 2.0 verifier scripts acquire their own toolchain at grading time
+-- `uv` from astral.sh/GitHub, then a CPython 3.13 toolchain and pytest from PyPI
+via `uvx`, tens of megabytes per trial, before any test runs. When that fails the
+verifier writes `reward.txt = 0`, which cannot be distinguished from the agent
+failing the task. On a host whose connectivity to GitHub is intermittently
+degraded this produces false negatives at a rate that swamps the effect being
+measured; on the reference host the **oracle scored 1/5**.
+
+`prepare_tasks.py` fixes that without touching the tests:
+
+```bash
+harbor download terminal-bench@2.0 -o tasks/terminal-bench
+
+python -m xharness_bench.prepare_tasks \
+  --source tasks/terminal-bench \
+  --output tasks-baked \
+  --uv-version 0.9.5 \
+  --manifest tasks-baked/manifest.json
+
+harbor run -p tasks-baked --agent oracle --force-build -n 3
+```
+
+It appends one Dockerfile layer that installs `uv` and runs the verifier's exact
+`uvx` command once, so the toolchain is already in the image's uv cache, and it
+neutralises the download line in `tests/test.sh` with `UV_OFFLINE=1`. The same
+tests then run against the same agent output.
+
+The claim that the tests are unchanged is checkable, not asserted: the manifest
+records a SHA-256 of `tests/test_outputs.py` for every task, computed before and
+after, so a reviewer can confirm the test body is byte-identical and that the
+Dockerfile patch is purely additive.
+
 ## Baselines are mandatory
 
 A pass rate without a floor is uninterpretable. Every reported comparison must

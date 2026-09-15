@@ -32,11 +32,24 @@ optimistic.
 | The upstream SDK version matching `dsh-v0.1.0-rc.8` exists on PyPI | the Tier A upstream arm cannot be installed; resolve before running |
 | Terminal-Bench task images reach a package mirror | `setup()` would fail; a task set with vendored dependencies avoids this |
 
+## The oracle gate has been exercised, and it failed
+
+Running the `oracle` baseline is not a formality here. On the first real attempt
+the reference solution scored **1/5**, both failures being verifier-side network
+errors before any test ran. That is the gate doing its job: the task set is not
+validated on this host, so no harness comparison could have been trusted.
+
+The response is `prepare_tasks.py`, which bakes the verifier's toolchain into the
+image so grading needs no network. Whether that restores oracle to ~100% is the
+open question -- see the run log, not the design.
+
 ## Not yet done
 
-1. **No end-to-end trial.** Nothing in this repository has been run against a
-   Terminal-Bench task through Harbor. The first milestone is a single task with
-   `oracle`, then a single task with the XHarness adapter.
+1. **No end-to-end trial of an adapter.** Harbor has now been driven end to end
+   and `oracle` has been run against real tasks, but no *adapter* from this
+   repository has completed a trial yet. The XHarness adapter is still unproven
+   through Harbor, which is the first thing to establish once the oracle gate
+   passes.
 3. **No task-hash freezing in the run loop.** `provenance.py` implements the
    freeze/verify step and is tested, but nothing yet calls `verify()` from the
    runner -- a run still has to be checked by hand.

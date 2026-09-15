@@ -170,6 +170,40 @@ broken environment than a uniformly hard task set. This is exactly the failure
 the `oracle` baseline exists to catch -- `nop` scoring 0 is expected, `oracle`
 scoring 0 never is.
 
+## Fixing the clone: a local mirror plus `insteadOf`
+
+Because Harbor re-clones on every run, and because the GitHub path proved
+unreliable (three separate failures over one session), the durable fix is to stop
+depending on it. A bare mirror plus a git URL redirect makes the step local and
+deterministic:
+
+```bash
+git clone --mirror https://github.com/laude-institute/terminal-bench-2.git ~/tb2-mirror.git
+# file:// transport only honours --filter=blob:none if the server allows it
+git -C ~/tb2-mirror.git config uploadpack.allowFilter true
+git -C ~/tb2-mirror.git config uploadpack.allowAnySHA1InWant true
+git config --global url."file://$HOME/tb2-mirror.git".insteadOf \
+  https://github.com/laude-institute/terminal-bench-2.git
+```
+
+Measured, on Harbor's exact clone arguments (`--filter=blob:none --depth 1
+--no-checkout`) followed by the same sparse-checkout and checkout Harbor
+performs:
+
+| | Before | After |
+| --- | --- | --- |
+| `git clone` | 60-120 s, failed 3 times | **0 s**, and the sparse-checkout and checkout both succeed |
+
+The mirror has to be refreshed (`git fetch --all`) to pick up dataset updates,
+which is the trade: determinism for a manual update step. `insteadOf` is global
+git configuration, so it affects every repository on the host, including this
+one -- worth remembering before wondering why a clone of the dataset is
+instantaneous.
+
+**Also required:** Docker Compose v2 (see above) and the pre-pulled task images.
+With all three in place, Harbor's own setup stops being the source of failures,
+which is the precondition for any harness measurement.
+
 ## Harbor re-clones the dataset on every run, with no cache
 
 `harbor/tasks/client.py` clones the dataset into
