@@ -243,6 +243,82 @@ machine-checkable rather than a matter of judgement.
 (`break-filter-js-from-html/`, `gpt2-codegolf/`, ...) with no enclosing `tasks/`
 directory, so a sparse-checkout path of `tasks` matches nothing.
 
+## Terminal-Bench verifiers are network-heavy, which turns a flaky network into false negatives
+
+This is the most consequential finding for whether the comparison can be run at
+all on a given host. Every Terminal-Bench 2.0 verifier script starts like this:
+
+```bash
+curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
+source $HOME/.local/bin/env
+uvx -p 3.13 -w pytest==8.4.1 -w pytest-json-ctrf==0.3.5 \
+  pytest --ctrf /logs/verifier/ctrf.json /tests/test_outputs.py -rA
+```
+
+So a single verification, independent of anything the agent did, requires:
+
+1. `apt-get update && apt-get install curl` (Debian mirrors),
+2. `astral.sh` -> a GitHub release for the `uv` binary,
+3. `uvx -p 3.13`, which downloads a **whole CPython 3.13 toolchain**, then pytest
+   and its dependencies from PyPI.
+
+That is three external services and tens of megabytes per trial. If any step
+fails, the script exits non-zero and writes `reward.txt = 0` -- which is
+indistinguishable from the agent having failed the task.
+
+Observed directly on the target host. First attempt, five tasks with the oracle
+(reference) solution applied:
+
+| Task | reward | Verifier output |
+| --- | ---: | --- |
+| `llm-inference-batching-scheduler` | **1** | 6 tests passed |
+| `break-filter-js-from-html` | 0 | `curl: (28) Failed to connect to github.com port 443 after 134767 ms` then `uvx: command not found` |
+| `write-compressor` | 0 | `curl: (56) Failure when receiving data from the peer`, then `uvx: command not found` |
+| `reshard-c4-data` | -- | build failed: needs `allenai/c4` from the Hugging Face Hub |
+| `gpt2-codec-golf` | -- | still building when the run was stopped |
+
+**The oracle scored 1/5. It should score ~100%.** Both failures are network
+errors in the *verifier*, before the tests were reached. The task set is
+therefore not validated on this host, and by this repository's own rule nothing
+can be concluded from any harness run on it yet.
+
+The connectivity itself is present but unstable. Measured over 12 samples 30 s
+apart, `https://github.com` answered 200 every time, but latency ranged from
+0.87 s to 9.98 s. A container on the default bridge reached `github.com` 6/6
+times in ~0.8 s, and the exact download the verifier needs
+(`https://github.com/astral-sh/uv/releases/download/0.9.5/...`, 21 MB) succeeded
+from both host and container at ~1.5 MB/s -- *after* the failed run. So the
+failures are transient degradation, not a block. The distribution has a long
+tail that includes 134-second connect hangs.
+
+**Why this is worse than an ordinary flake.** The failure is asymmetric across
+arms. A network failure costs an arm a trial at random, so with enough tasks it
+adds noise rather than bias -- but it also puts a ceiling on the measurable pass
+rate and, critically, moves trials into the failure bucket where a real harness
+difference would also land. At an observed rate of roughly 2 in 5, a 300-task run
+would be dominated by verifier noise.
+
+**Countermeasures, in order of preference.**
+
+1. **Bake the verifier's dependencies into the image.** Pre-install `uv` and warm
+   its cache (CPython 3.13, pytest, pytest-json-ctrf) at build time, so the
+   verifier needs no network. This changes nothing about what is being tested --
+   the verifier still runs the same tests against the same agent output -- it
+   only removes the harness's own network dependency. This is the right fix and
+   is the only one that makes a long run viable.
+2. **Require oracle ≈ 100% as a gate before any comparison.** This is already the
+   documented rule; this episode is what it is for. Run `oracle` first, and if it
+   does not come back at essentially 100%, stop.
+3. **Classify rather than absorb.** A trial whose verifier never reached the tests
+   belongs in `harness_error`, not in the pass rate. `report.classify` already
+   routes absent-`final_response` failures there; the verifier-side detection
+   needs the CTRF output or a `uvx: command not found` marker to be reliable.
+
+Also worth noting: `reshard-c4-data` legitimately cannot build here, because its
+setup downloads `allenai/c4` from the Hugging Face Hub. Tasks with dataset
+dependencies of their own need that access too, and a task set should be screened
+for which tasks are even runnable on the host before a task list is frozen.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command
