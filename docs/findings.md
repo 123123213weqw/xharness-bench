@@ -723,6 +723,49 @@ Verified live, on the real endpoint, by running the actual adapter classes:
 asserts exact numbers and needs no credential; `--live` proves the credential path
 and the real streaming protocol, which a fake provider cannot.
 
+## "Unlimited" is not the same as usable, and the fast path flipped
+
+Traffic planning started from quota: task images are 41.5 GiB deduplicated, a
+metered allowance could not absorb that, so an unmetered node was made the default
+for bulk and verifier traffic with the metered nodes as fallback.
+
+That arrangement was correct for about an hour and then inverted. Measured with a
+15-second sample of the same 21 MB download, per node:
+
+| Node | Result |
+| --- | ---: |
+| unmetered A | 458 KB (30 KB/s) |
+| unmetered B | 0 bytes, `000` -- dead |
+| metered, Japan | **21 MB, completed** |
+| metered, Hong Kong | **21 MB, completed** |
+
+and from inside a task container through the metered node, the same download took
+**9 seconds**. The node's own latency probe still answered in 60 ms while it was
+moving 30 KB/s -- a health check that measures reachability tells you nothing
+about throughput, which is what actually matters here.
+
+The subscription URL for the unmetered service also stopped responding on its own
+endpoint during this window, so the failure was upstream rather than local.
+
+**Why it mattered.** While the slow node was selected, the gate produced
+`curl: (18)` (transfer closed) and `curl: (35)` (`SSL_ERROR_SYSCALL`) inside
+verifiers, then `uvx: command not found` -- a signature easily mistaken for
+egress being broken in general rather than for one node being slow. Those
+failures are indistinguishable in the output from a task that cannot pass, which
+is exactly the confusion T12 and T13 describe.
+
+**The lesson is not "prefer metered".** It is that node selection has to be
+measured at the time of use, not decided once from a subscription's stated
+properties. "Unlimited" is a billing attribute; it says nothing about bandwidth,
+congestion, or whether the endpoint is up. A bandwidth probe -- fetch a known-size
+object and time it -- is the only check that answers the question being asked.
+
+**Consequence for the quota plan.** The remaining 24 GiB of task images are the
+expensive part, and the unmetered option for them is currently non-functional.
+The measurements above ran on 57 of 89 images, which is enough to freeze a task
+list and run the comparison; completing the image set is deferred rather than
+paid for out of a metered allowance that would not survive it.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command
