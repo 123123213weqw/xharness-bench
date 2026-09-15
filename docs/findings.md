@@ -407,6 +407,66 @@ setup downloads `allenai/c4` from the Hugging Face Hub. Tasks with dataset
 dependencies of their own need that access too, and a task set should be screened
 for which tasks are even runnable on the host before a task list is frozen.
 
+## The host's control plane, established by experiment
+
+Every claim below was checked against the shipped binary, driven over its own
+loopback RPC. Reading the source would not have caught most of it.
+
+**Flags and environment variables are both accepted, and flags are strictly
+validated.** `--definitely-bogus 1` fails with `unknown argument`, so a wrong flag
+name is a loud error rather than a silent no-op. Most settings have both forms: `--bind` / `XHARNESS_BIND`, `--state-dir` /
+`XHARNESS_STATE_DIR`, `--desktop-token` / `XHARNESS_DESKTOP_TOKEN`, and so on.
+
+**A context window is mandatory once a model is configured.** Without it the host
+refuses to start:
+
+```
+Error: "configured models require a Provider/deployment context capability
+        or an explicitly labelled fallback_context_window_tokens value"
+```
+
+This is a startup failure, not a degraded mode, so an adapter that leaves it
+optional never gets off the ground.
+
+**`--bind 127.0.0.1:0` works**, and the ready file contains exactly `host:port`.
+That is what lets a task container need no port publishing.
+
+**The desktop token is enforced.** `workspace.list` without
+`x-xharness-desktop-token` answers `401 desktop authentication required`.
+
+**Credentials flow through `XHARNESS_API_KEY`.** Confirmed by pointing
+`XHARNESS_BASE_URL` at a local echo server and reading back the header:
+`Authorization: Bearer <the key that was set>`.
+
+**The token dimensions are non-overlapping**, which is not obvious from the names
+and matters for any cost comparison. Feeding the host known numbers
+(`prompt_tokens=1234, cached_tokens=900, completion_tokens=56,
+reasoning_tokens=20`) produced:
+
+```json
+"usage": {"inputTokens": 334, "outputTokens": 36, "cacheReadTokens": 900,
+          "cacheWriteTokens": 0, "reasoningTokens": 20}
+```
+
+So `inputTokens` **excludes** cache reads (1234 - 900 = 334), and `outputTokens`
+**excludes** reasoning (56 - 20 = 36). Summing the five is therefore safe;
+dropping `reasoningTokens` silently understates cost.
+
+**Tool approval is a settings mutation, and it must happen before the session is
+created.** The `permission` namespace defaults to `workspace-write` with approval
+policy `ask`; `settings.mutate` on `defaultPreset` moves the session to
+`danger-full-access` with policy `never`, and the session events record it. Order
+matters -- mutating after `session.create` leaves that session on the default.
+A missing namespace must be a hard error: falling through silently leaves the
+agent waiting on approvals no human will answer, which surfaces as a turn timeout
+and is easily misread as a harness defect.
+
+**The permission preset changes the system prompt.** The request body sent to the
+provider contains `The session uses workspace-write isolation ...` under the
+default preset. So the preset is not merely an approval gate; it is part of the
+agent's instructions, and it must be pinned identically across arms or the
+comparison is confounded.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command

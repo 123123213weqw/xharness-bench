@@ -21,10 +21,28 @@ bundled GTK/WebKit stack is broken on Mesa 26 (``EGL_BAD_PARAMETER``).  That is
 irrelevant here because only ``xharness-host`` and the static web assets are
 extracted, but it is the same artifact, so the version pin matters.
 
-Status: the control-plane sequence below is taken from the in-repo reference
-driver (``scripts/agent-live-eval.py``, ``scripts/compaction-ablation.py``) and
-mirrors the host's own argument parser.  It has not yet been run end-to-end
-against a Terminal-Bench task from this repository -- see ``docs/status.md``.
+Status: the control-plane sequence is verified against the shipped binary, driven
+live over the host's own loopback RPC. Established by direct experiment, not by
+reading:
+
+* the desktop token is genuinely required -- ``workspace.list`` without
+  ``x-xharness-desktop-token`` answers 401 ``desktop authentication required``;
+* ``--bind 127.0.0.1:0`` works and the ready file contains ``host:port``;
+* ``XHARNESS_DESKTOP_TOKEN`` and ``XHARNESS_API_KEY`` are the correct environment
+  variable names (confirmed by pointing ``XHARNESS_BASE_URL`` at a local echo
+  server and observing ``Authorization: Bearer <the key we set>``);
+* ``--context-window`` is mandatory whenever a model is configured -- without it
+  the host exits with ``configured models require a Provider/deployment context
+  capability or an explicitly labelled fallback_context_window_tokens value``;
+* ``settings.mutate`` on the ``permission`` namespace moves the session to
+  ``danger-full-access`` with approval policy ``never``, and the session events
+  record it;
+* a completed turn emits ``assistant/message`` carrying a five-field ``usage``,
+  followed by ``turn/end`` with ``reason.kind == "completed"``.
+
+It has not yet completed a Terminal-Bench trial, because the task set's oracle
+baseline does not yet pass on the reference host -- see ``docs/status.md``.
+
 """
 
 from __future__ import annotations
@@ -102,7 +120,14 @@ class XHarnessAgent(BaseAgent):
         version: str | None = None,
         provider: str = "deepseek",
         base_url: str | None = None,
-        context_window: int | None = None,
+        # Required by the host, not optional. With a configured model and no
+        # context window, xharness-host refuses to start:
+        #   Error: "configured models require a Provider/deployment context
+        #           capability or an explicitly labelled
+        #           fallback_context_window_tokens value"
+        # Verified against the shipped binary. Pin it per arm so both arms run
+        # the same budget.
+        context_window: int = 65536,
         max_output_tokens: int | None = None,
         extra_args: list[str] | None = None,
         turn_timeout_sec: int = 1800,
@@ -160,9 +185,29 @@ class XHarnessAgent(BaseAgent):
         return version, f"desktop-v{version}", str(platform["url"])
 
     def prepare_bundle(self) -> Bundle:
-        """Download, checksum-verify and extract the release (host side, cached)."""
+        """Return the release, from cache when possible.
+
+        A pinned version plus a warm cache needs no network at all, and that is
+        checked *first* on purpose. Resolving the manifest before consulting the
+        cache would couple every trial to GitHub's availability for no benefit,
+        since comparability already requires the version to be pinned -- and
+        GitHub was observed failing intermittently on the reference host.
+        """
         if self._bundle is not None:
             return self._bundle
+
+        if self._requested_version:
+            pinned_tag = f"desktop-v{self._requested_version}"
+            cached = self._cache_dir / pinned_tag
+            if (cached / "xharness-host").is_file() and (cached / "web").is_dir():
+                self._bundle = Bundle(
+                    self._requested_version,
+                    pinned_tag,
+                    cached / "xharness-host",
+                    cached / "web",
+                    _sha256(cached / "xharness-host"),
+                )
+                return self._bundle
 
         version, tag, url = self._resolve_release()
         target = self._cache_dir / tag
@@ -288,8 +333,8 @@ class XHarnessAgent(BaseAgent):
             args += ["--model", self.model_name]
         if self._base_url:
             args += ["--base-url", self._base_url]
-        if self._context_window:
-            args += ["--context-window", str(self._context_window)]
+        # Always passed; see the note on context_window in __init__.
+        args += ["--context-window", str(self._context_window)]
         if self._max_output_tokens:
             args += ["--max-output-tokens", str(self._max_output_tokens)]
         args += self._extra_args
@@ -340,7 +385,17 @@ class XHarnessAgent(BaseAgent):
             None,
         )
         if permission is None:
-            return
+            # Do not fall through silently. Without this the session keeps the
+            # default `workspace-write` preset and `ask` approval policy
+            # (verified: the session then emits permission/preset=workspace-write
+            # and approval/policy=ask), so the agent blocks on approvals no human
+            # will answer and the trial dies on the turn timeout -- a slow,
+            # confusing failure that looks like a harness problem.
+            raise RuntimeError(
+                "settings.describe exposed no 'permission' namespace, so the "
+                "adapter cannot switch the session to unattended tool use; the "
+                "agent would block on approval prompts"
+            )
         await client.call(
             "settings.mutate",
             {
@@ -407,7 +462,15 @@ class XHarnessAgent(BaseAgent):
         events: list[dict[str, Any]],
         elapsed: float,
     ) -> None:
-        input_tokens = cache_tokens = output_tokens = 0
+        # Five non-overlapping dimensions, confirmed against a live host by
+        # feeding a fake provider known numbers: with prompt_tokens=1234 and
+        # cached_tokens=900 the host reported inputTokens=334 (= 1234 - 900),
+        # and with completion_tokens=56 and reasoning_tokens=20 it reported
+        # outputTokens=36 (= 56 - 20). So inputTokens excludes cache reads and
+        # outputTokens excludes reasoning. Summing them is therefore safe, but
+        # dropping reasoning would understate cost, so it is tracked separately.
+        input_tokens = output_tokens = 0
+        cache_read = cache_write = reasoning = 0
         tool_calls = 0
         answers: list[str] = []
         reasons: list[str] = []
@@ -420,13 +483,9 @@ class XHarnessAgent(BaseAgent):
                 if isinstance(usage, dict):
                     input_tokens += _usage_number(usage, "inputTokens", "input_tokens")
                     output_tokens += _usage_number(usage, "outputTokens", "output_tokens")
-                    cache_tokens += _usage_number(
-                        usage,
-                        "cacheReadTokens",
-                        "cache_read_tokens",
-                        "cacheWriteTokens",
-                        "cache_write_tokens",
-                    )
+                    cache_read += _usage_number(usage, "cacheReadTokens", "cache_read_tokens")
+                    cache_write += _usage_number(usage, "cacheWriteTokens", "cache_write_tokens")
+                    reasoning += _usage_number(usage, "reasoningTokens", "reasoning_tokens")
                 answers.append(message_text(data.get("message", data)))
             elif isinstance(kind, str) and kind.startswith("tool/"):
                 tool_calls += 1
@@ -435,15 +494,28 @@ class XHarnessAgent(BaseAgent):
                 if isinstance(reason, dict) and isinstance(reason.get("kind"), str):
                     reasons.append(reason["kind"])
 
+        # Harbor's AgentContext has three token fields, so the full five-way
+        # split goes into metadata where it survives into the result row.
         context.n_input_tokens = input_tokens
-        context.n_cache_tokens = cache_tokens
+        context.n_cache_tokens = cache_read + cache_write
         context.n_output_tokens = output_tokens
         context.metadata = {
             **(context.metadata or {}),
             "elapsed_sec": round(elapsed, 3),
             "tool_calls": tool_calls,
             "turn_end_reasons": reasons,
+            # "completed" is the clean finish; anything else (e.g. "error") means
+            # the harness itself failed and the trial is not evidence about the
+            # model or the task.
+            "turn_completed": "completed" in reasons,
             "final_response": answers[-1] if answers else "",
             "xharness_version": self.version(),
             "xharness_host_sha256": self._bundle.sha256 if self._bundle else None,
+            "tokens": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "reasoning_tokens": reasoning,
+            },
         }

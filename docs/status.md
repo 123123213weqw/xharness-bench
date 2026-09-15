@@ -49,13 +49,32 @@ The response is `prepare_tasks.py`, which bakes the verifier's toolchain into th
 image so grading needs no network. Whether that restores oracle to ~100% is the
 open question -- see the run log, not the design.
 
+## The adapter is verified against the real binary
+
+`tests/smoke_local.py` drives the actual `XHarnessAgent` class against a real
+`xharness-host` on the local machine -- no container, no credential, no
+Terminal-Bench. It supplies a duck-typed `BaseEnvironment` (the adapter only ever
+calls `exec`, `upload_file` and `upload_dir`) and a fake SSE provider that reports
+known token counts, so the whole control-plane sequence runs in seconds.
+
+Result: **10/10 checks pass**, including all five token dimensions arriving
+intact and `turn/end` reporting a clean `completed`.
+
+This covers exactly what the oracle baseline cannot: the oracle never invokes an
+adapter, so a broken adapter would show up only as a mysterious low score
+attributed to the harness. It does *not* show that a real model solves anything --
+that needs the benchmark.
+
+The desktop shell is deliberately out of scope. The adapter extracts
+`xharness-host` and the static assets and never runs the AppImage runtime, so the
+shipped GUI's EGL failure on Mesa 26 has no bearing on these measurements.
+
 ## Not yet done
 
-1. **No end-to-end trial of an adapter.** Harbor has now been driven end to end
-   and `oracle` has been run against real tasks, but no *adapter* from this
-   repository has completed a trial yet. The XHarness adapter is still unproven
-   through Harbor, which is the first thing to establish once the oracle gate
-   passes.
+1. **No Terminal-Bench trial by an adapter.** Harbor has been driven end to end,
+   `oracle` has been run against real tasks, and the adapter is verified against
+   the real host locally. What has never happened is an adapter completing a
+   *benchmark* trial -- which needs the oracle gate to pass first.
 3. **No task-hash freezing in the run loop.** `provenance.py` implements the
    freeze/verify step and is tested, but nothing yet calls `verify()` from the
    runner -- a run still has to be checked by hand.
