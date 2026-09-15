@@ -467,6 +467,85 @@ default preset. So the preset is not merely an approval gate; it is part of the
 agent's instructions, and it must be pinned identically across arms or the
 comparison is confounded.
 
+## Egress: the host needed a working proxy, and what that actually fixes
+
+The reference host had no reliable path to GitHub: 12/12 probes answered 200 but
+latency ranged 0.87-9.98 s with a long tail that included 134-second connect
+hangs, and three separate `git clone` attempts failed outright over one session.
+Terminal-Bench verifiers download a toolchain before every test, so those hangs
+landed directly in the reward signal. A local proxy removes that class of failure.
+
+**What was verified working.** A mihomo (Clash.Meta) instance on
+`127.0.0.1:7890`, run as a systemd service, reachable by every component that
+needs it:
+
+| Consumer | Path | Verified by |
+| --- | --- | --- |
+| host shells, git, curl | `127.0.0.1:7890` | `github.com` 200 through the proxy |
+| the Docker daemon | `127.0.0.1:7890` via a systemd drop-in | proxy vars present in `/proc/<dockerd>/environ` |
+| task containers | `172.17.0.1:7890` | `docker compose` probe showed all six proxy variables inside the container |
+| image builds | same, injected as build args | `RUN env \| grep -i proxy` in a test build |
+
+**Containers could not reach GitHub directly, and can through the host.** Measured
+in the same container: `curl https://github.com` timed out after 15 s, while
+`curl -x http://172.17.0.1:7890 https://github.com` returned 200 in 0.55 s. That
+one fact is the difference between a verifier that downloads its toolchain and one
+that reports `reward=0`.
+
+`172.17.0.1` is safe to hardcode here specifically because Harbor defines **no
+custom compose networks** -- `docker-compose-prebuilt.yaml` and
+`docker-compose-build.yaml` have no `networks:` section, so task containers sit on
+the default bridge. That would not hold for a harness that creates per-trial
+networks, and the address would need to come from the compose file instead.
+
+### Two traps worth recording
+
+**`bind-address` accepts a comma-separated list and then silently binds nothing.**
+Setting `bind-address: "127.0.0.1,172.17.0.1"` passes `mihomo -t`, starts the
+process, and leaves the RESTful API answering on `:9090` -- but `ss -tlnp` shows
+**nothing listening on 7890**. Every downstream test then fails for a reason that
+looks like a network problem. The config validator is not the authority on whether
+a listener came up; `ss` is. The working arrangement is `bind-address: "*"` plus an
+iptables rule restricting the port by interface.
+
+**A heredoc fed to a password-reading sudo wrapper gets consumed by the password.**
+The pattern
+
+```bash
+S() { echo "$PW" | sudo -S -p '' "$@"; }
+S tee /etc/foo.conf <<'CONF'
+...
+CONF
+```
+
+does not write the heredoc: the function's own pipe wins, `sudo -S` reads the
+password, and `tee` writes *the password* into the target file. It fails silently
+and in the most damaging direction. Write the file as the unprivileged user first
+and `sudo install` it, which is what the setup now does. Checked afterwards with a
+recursive grep for the credential, and the two damaged files were shredded.
+
+### Quota shapes the design
+
+A metered subscription makes *where* traffic goes a design decision, not an
+implementation detail. Task images are ~1.5 GB each and there are 89 of them;
+pulling those through the proxy would cost more than the remaining quota. So:
+
+- the registry mirrors stay configured and are listed in the daemon's `NO_PROXY`,
+  so image pulls do not consume proxy quota, and
+- image pulls fall back to the proxy only when a mirror stalls, and
+- verifier toolchain downloads *do* go through the proxy, because those are tens
+  of megabytes rather than gigabytes -- and baking (`prepare_tasks.py`) reduces
+  even that to once per task image instead of once per trial.
+
+### The proxy is not a substitute for baking
+
+82 of 89 verifier scripts run `apt-get`, and the packages are not incidental:
+`gcc`, `ffmpeg`, `tesseract-ocr`, `primer3`, `imagemagick`, `binutils` and more.
+Three tasks additionally fetch from `download.pytorch.org` or raw GitHub. Baking
+the uv toolchain removes the *dominant* per-trial download, but a generic egress
+path is still required, which is what the proxy provides. The two are
+complementary: baking cuts cost and repeat latency, the proxy covers the tail.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command
