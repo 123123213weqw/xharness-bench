@@ -165,12 +165,36 @@ src/xharness_bench/
   rpc.py                  JSON-RPC client; drives the host over the container's loopback
   agents/xharness.py      XHarness adapter
   agents/dsh_upstream.py  upstream DeepSeek Harness adapter
-  report.py               Wilson intervals, exact McNemar, failure classification
+  report.py               Wilson intervals, exact McNemar, failure taxonomy, aggregation CLI
+  provenance.py           freeze the task list and interleave the run order
 configs/                  Tier A and Tier B run configurations
 docs/validity.md          threats to validity and the countermeasures
 docs/findings.md          facts established while building this, with evidence
 docs/status.md            what is verified vs. still assumed
 ```
+
+## Freeze the plan before measuring
+
+Countermeasure T10 is procedural, so it needs a tool rather than a resolution.
+Freeze the task set first and publish the digest; the verification step then
+fails loudly if the run measured something else:
+
+```bash
+# before running anything
+python -m xharness_bench.provenance \
+  --dataset terminal-bench --version 2.0 \
+  --tasks task-ids.txt --arms xharness,dsh-upstream \
+  --output frozen-plan.json
+
+# after collecting the task list actually used
+python -m xharness_bench.provenance \
+  --dataset terminal-bench --version 2.0 \
+  --tasks observed-ids.txt --arms xharness,dsh-upstream \
+  --verify frozen-plan.json
+```
+
+The digest is order-independent, so it detects tasks being *swapped*, not merely
+reordered. Schedule order is interleaved by construction (T2).
 
 ## License
 

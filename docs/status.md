@@ -19,6 +19,8 @@ optimistic.
 | Both adapters load through Harbor's own factory | `AgentFactory.create_agent_from_import_path(...)` returned instances under Harbor 0.23.0 |
 | The RPC envelope format is correct | unit test asserts the `client-request` envelope, the `x-xharness-desktop-token` header and `RpcError` on a failed envelope |
 | `report.py` statistics are correct | checked against published values: Wilson(0,10)=[0, 0.2775], Wilson(5,10)=[0.2366, 0.7634], exact McNemar(10,2)=0.03857, symmetry, and n≈194 / n≈783 for 10pp / 5pp |
+| The report CLI parses and classifies | run against synthetic job JSON in both supported shapes; produced per-harness rates with CIs, the failure taxonomy, a paired McNemar comparison and the resolution-floor warning |
+| Task-set freezing detects a swapped task | freeze 5 IDs, re-verify the same list (OK) and a 4-ID list (MISMATCH, exit 1); digest confirmed order-independent |
 
 ## Assumed, not yet verified
 
@@ -35,10 +37,9 @@ optimistic.
 1. **No end-to-end trial.** Nothing in this repository has been run against a
    Terminal-Bench task through Harbor. The first milestone is a single task with
    `oracle`, then a single task with the XHarness adapter.
-2. **No `report` CLI.** `report.py` has the statistical functions; the
-   command-line entry point referenced in the README is not written yet.
-3. **No task-hash freezing.** The provenance step that hashes and publishes the
-   frozen task list (countermeasure T10) is designed but not implemented.
+3. **No task-hash freezing in the run loop.** `provenance.py` implements the
+   freeze/verify step and is tested, but nothing yet calls `verify()` from the
+   runner -- a run still has to be checked by hand.
 4. **No cost source.** `cost_usd` is plumbed through `AgentContext` but no price
    table is wired up, so `cost_per_solved_task` cannot be computed yet.
 5. **`tasks/` is empty.** Held-out private tasks (countermeasure T3) are not

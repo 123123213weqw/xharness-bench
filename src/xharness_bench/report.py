@@ -190,3 +190,245 @@ def compare(rows: Iterable[dict[str, Any]], baseline: str, candidate: str) -> Co
         else:
             result.both_fail += 1
     return result
+
+# --------------------------------------------------------------------- loading
+
+
+def _first(mapping: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
+def _dig(mapping: Any, *path: str) -> Any:
+    cursor = mapping
+    for step in path:
+        if not isinstance(cursor, dict) or step not in cursor:
+            return None
+        cursor = cursor[step]
+    return cursor
+
+
+def row_from_trial(
+    trial: dict[str, Any], task_id: str, harness: str, source: str
+) -> dict[str, Any] | None:
+    """Map one Harbor trial record onto this repository's flat result row.
+
+    Harbor's on-disk schema is not part of its public contract, so every field is
+    read through a list of candidate paths, and a missing reward is treated as
+    "no result" rather than as a failure. Inferring *failure* from an absent
+    field would silently invent losses, which is the one error that would corrupt
+    the comparison.
+    """
+    reward = _first(
+        trial, "reward", "score", default=_dig(trial, "verifier_result", "reward")
+    )
+    if reward is None:
+        reward = _dig(trial, "result", "reward")
+    if reward is None:
+        return None
+
+    agent_result = (
+        trial.get("agent_result") if isinstance(trial.get("agent_result"), dict) else {}
+    )
+    metadata = {
+        "timeout": bool(_first(trial, "timeout", default=False)),
+        "final_response": _first(agent_result, "final_response", "output", default=""),
+        "turn_end_reasons": _first(agent_result, "turn_end_reasons", default=[]),
+        "elapsed_sec": _first(
+            agent_result, "elapsed_sec", default=_first(trial, "elapsed_sec")
+        ),
+        "tool_calls": _first(agent_result, "tool_calls"),
+        "xharness_version": _first(agent_result, "xharness_version"),
+        "xharness_host_sha256": _first(agent_result, "xharness_host_sha256"),
+    }
+
+    return {
+        "task_id": task_id,
+        "harness": harness,
+        "passed": float(reward) >= 1.0,
+        "reward": float(reward),
+        "n_input_tokens": int(
+            _first(trial, "n_input_tokens", default=_dig(trial, "metrics", "n_input_tokens")) or 0
+        ),
+        "n_output_tokens": int(
+            _first(trial, "n_output_tokens", default=_dig(trial, "metrics", "n_output_tokens")) or 0
+        ),
+        "n_cache_tokens": int(
+            _first(trial, "n_cache_tokens", default=_dig(trial, "metrics", "n_cache_tokens")) or 0
+        ),
+        "cost_usd": _first(trial, "cost_usd", default=_dig(trial, "metrics", "cost_usd")),
+        "wall_clock_sec": _first(
+            trial, "wall_clock_sec", default=_dig(trial, "metrics", "wall_clock_sec")
+        ),
+        "metadata": {k: v for k, v in metadata.items() if v is not None},
+        "error": _first(trial, "error", "exception_info", default=None),
+        "source": source,
+    }
+
+
+def load_harbor_jobs(root: Path) -> list[dict[str, Any]]:
+    """Read every Harbor job directory under ``root`` into flat rows.
+
+    Layout-agnostic: any JSON payload carrying per-trial results is considered,
+    so a Harbor schema change degrades to an empty parse (loud, via --inspect)
+    rather than to a confidently wrong number.
+    """
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.glob("**/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        # Shape 1: {"results": [{"task_id": ..., "reward": ...}, ...]}
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if isinstance(results, list):
+            for entry in results:
+                if not isinstance(entry, dict):
+                    continue
+                row = _row_from_entry(entry, path)
+                if row:
+                    rows.append(row)
+
+        # Shape 2: a single trial record per file.
+        elif isinstance(payload, dict) and any(
+            key in payload for key in ("reward", "verifier_result", "trial_name")
+        ):
+            row = _row_from_entry(payload, path)
+            if row:
+                rows.append(row)
+    return rows
+
+
+def _row_from_entry(entry: dict[str, Any], path: Path) -> dict[str, Any] | None:
+    task_id = _first(entry, "task_id", "taskId", "task_name", "trial_name", "name")
+    harness = _first(entry, "agent_name", "agent", "harness", default=path.parent.name)
+    if isinstance(harness, dict):
+        harness = _first(harness, "name", "import_path", default=path.parent.name)
+    if not isinstance(task_id, str) or not isinstance(harness, str):
+        return None
+    return row_from_trial(entry, task_id, harness, str(path))
+
+
+# ------------------------------------------------------------------------ CLI
+
+
+def _fmt_rate(passed: int, total: int) -> str:
+    if total == 0:
+        return "n/a"
+    low, high = wilson(passed, total)
+    return f"{passed / total * 100:5.1f}% [{low * 100:4.1f},{high * 100:4.1f}]"
+
+
+def render(
+    rows: list[dict[str, Any]], baseline: str | None, candidate: str | None
+) -> str:
+    lines: list[str] = []
+    by_harness: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_harness.setdefault(row["harness"], []).append(row)
+
+    if not by_harness:
+        return (
+            "no results parsed -- check --results, or use --inspect to see what "
+            "was actually found"
+        )
+
+    lines.append(f"parsed {len(rows)} trial rows across {len(by_harness)} harness(es)")
+    lines.append("")
+    lines.append(f"{'harness':<24}{'pass rate [95% CI]':<28}{'n':>4}  {'med s':>7}")
+    lines.append("-" * 72)
+    for name in sorted(by_harness):
+        group = by_harness[name]
+        passed = sum(1 for r in group if r["passed"])
+        elapsed = sorted(
+            r["metadata"].get("elapsed_sec")
+            for r in group
+            if isinstance(r["metadata"].get("elapsed_sec"), (int, float))
+        )
+        median = f"{elapsed[len(elapsed) // 2]:.0f}" if elapsed else "-"
+        lines.append(
+            f"{name:<24}{_fmt_rate(passed, len(group)):<28}{len(group):>4}  {median:>7}"
+        )
+
+    lines.append("")
+    lines.append("failure classification (rule-based, mutually exclusive)")
+    lines.append("-" * 72)
+    for name in sorted(by_harness):
+        kinds: dict[str, int] = {}
+        for row in by_harness[name]:
+            kind = classify(row)
+            kinds[kind] = kinds.get(kind, 0) + 1
+        rendered = "  ".join(
+            f"{k}={v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])
+        )
+        lines.append(f"{name:<24}{rendered}")
+
+    if baseline and candidate and baseline in by_harness and candidate in by_harness:
+        comparison = compare(rows, baseline, candidate)
+        summary = comparison.summary()
+        lines.append("")
+        lines.append(f"paired comparison: {candidate} vs {baseline}")
+        lines.append("-" * 72)
+        lines.append(f"  paired tasks      {summary['tasks']}")
+        lines.append(f"  {baseline:<17} {summary['baseline_pass_rate']}")
+        lines.append(f"  {candidate:<17} {summary['candidate_pass_rate']}")
+        lines.append(f"  delta             {summary['delta']:+.4f}")
+        lines.append(
+            f"  discordant        {summary['discordant']} "
+            f"({comparison.only_baseline} only-{baseline}, "
+            f"{comparison.only_candidate} only-{candidate})"
+        )
+        lines.append(f"  exact McNemar p   {summary['p_value']}")
+        if summary["skipped"]:
+            lines.append(f"  skipped unpaired  {summary['skipped']}")
+        lines.append("")
+        lines.append("  resolution floor (report this next to any conclusion):")
+        for target in (0.10, 0.05):
+            needed = tasks_required(target)
+            verdict = (
+                "resolvable"
+                if summary["tasks"] >= needed
+                else f"UNDERPOWERED, needs ~{needed}"
+            )
+            lines.append(f"    {int(target * 100):>2}pp difference: {verdict}")
+
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Aggregate harness comparison results")
+    parser.add_argument("--results", type=Path, default=Path("runs"))
+    parser.add_argument("--baseline")
+    parser.add_argument("--candidate")
+    parser.add_argument("--json", action="store_true", help="emit parsed rows as JSON")
+    parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="print the first parsed rows verbatim, to diagnose schema drift",
+    )
+    args = parser.parse_args(argv)
+
+    rows = load_harbor_jobs(args.results)
+    if not rows:
+        rows = load_results(args.results)
+
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0 if rows else 1
+    if args.inspect:
+        print(f"{len(rows)} row(s) parsed from {args.results}")
+        for row in rows[:5]:
+            print(json.dumps(row, indent=2, ensure_ascii=False))
+        return 0
+
+    print(render(rows, args.baseline, args.candidate))
+    return 0 if rows else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
