@@ -195,6 +195,46 @@ and no amount of statistical care downstream would have detected it. This is the
 strongest argument in this repository for the oracle gate being load-bearing
 rather than ceremonial.
 
+## T13 -- Task bit rot, and why the oracle gate is not a 100% requirement
+
+The oracle gate's job is not to score 100%. It is to **identify which tasks are
+broken** so they can be excluded before a comparison. The valid task set is the
+one where the reference solution passes; a requirement of "100% on everything
+ever published" would make the gate unpassable for reasons that have nothing to
+do with the benchmark.
+
+Measured on 2026-09-15 against a task set published 2025-10-31, four failures --
+**all four task-side, none environmental**:
+
+| Task | Failure | Root cause |
+| --- | --- | --- |
+| `build-pov-ray` | `povray.org` returns 403 | the URL is dead; **direct and proxied both return 403**, same 5564-byte body, so it is not the egress path |
+| `make-doom-for-mips` | `apt` cannot fetch `libpng16-16_1.6.39-2`, `libtiff6_4.5.0-6+deb12u2`, ... | Debian removes superseded pool entries; `curl` on that exact `.deb` URL returns 404 today |
+| `build-pmars` | `E: Version '1.22.21' for 'dpkg-dev' was not found` | the pinned version has left the archive |
+| `build-cython-ext` | `test_reconstructed_space_curve` fails inside the vendored repository | upstream code, unrelated to the harness |
+
+The pattern is that these tasks pin **external state that expires**: exact package
+versions, a specific third-party URL, a vendored dependency's own test suite. Near
+the publication date they pass; a year later some of them cannot.
+
+**Why this must be handled by exclusion rather than tolerance.** A task that fails
+for the oracle fails for every arm. Including it does not add noise evenly -- it
+adds a *constant* zero, which dilutes any real difference and, worse, rewards
+whichever arm happens to retry more or to reach a mirror that still has the
+package. The task is not measuring the harness, so it must not appear in the
+denominator.
+
+**Procedure.** Run the gate; classify every failure as environmental or task-side;
+freeze the task list from the tasks whose oracle passed; publish that list and its
+digest (countermeasure T10). Tasks that fail here are recorded as excluded, with
+the reason, rather than silently dropped.
+
+**Note the interaction with T12.** An environmental failure and a contention
+failure look identical in the output -- both are "oracle scored 0". Telling them
+apart required reading the verifier logs and re-testing the URLs directly. That is
+why the gate must run on a quiet host: with contention in play there is no way to
+distinguish "this task is broken" from "this run was starved".
+
 ## Resolution floor
 
 From `report.tasks_required`: detecting a 5-point difference at 80% power needs

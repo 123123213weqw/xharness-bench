@@ -32,6 +32,18 @@ optimistic.
 | The upstream SDK version matching `dsh-v0.1.0-rc.8` exists on PyPI | the Tier A upstream arm cannot be installed; resolve before running |
 | Terminal-Bench task images reach a package mirror | `setup()` would fail; a task set with vendored dependencies avoids this |
 
+## Four tasks cannot pass the gate, and they are the tasks' fault
+
+Measured against a set published 2025-10-31: `build-pov-ray` (its source URL
+returns 403 to direct *and* proxied requests alike), `make-doom-for-mips` and
+`build-pmars` (pinned Debian package versions that the archive has since removed
+-- verified by fetching the exact `.deb` and getting 404), and `build-cython-ext`
+(a test failing inside its vendored repository).
+
+These are excluded from the frozen task list, with the reason recorded, rather
+than tolerated. A task the oracle cannot solve adds a constant zero to every arm,
+which dilutes real differences and rewards whichever arm retries more.
+
 ## Both adapters run against the real endpoint with a real credential
 
 Verified by driving the actual adapter classes, not by reading them:
