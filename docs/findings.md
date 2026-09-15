@@ -170,6 +170,47 @@ broken environment than a uniformly hard task set. This is exactly the failure
 the `oracle` baseline exists to catch -- `nop` scoring 0 is expected, `oracle`
 scoring 0 never is.
 
+## Quantified: the oracle baseline cannot reach 100% on this host without the fix
+
+After clearing the infrastructure problems, a full oracle run on the published
+images gave this:
+
+| | count |
+| --- | ---: |
+| passed | 4 |
+| failed, **verifier network error** | 3 |
+| failed, no test output | 1 |
+| not yet judged / exception | 3 |
+
+**3 of 8 judged trials failed for a reason unrelated to the agent**, with the
+reference solution applied: `merge-diff-arc-agi-task`, `password-recovery` and
+`write-compressor`, each showing a uv or CPython download failure from GitHub in
+the verifier stdout.
+
+This is the number that gates everything. A benchmark whose floor is 50% and
+whose losses are coin flips cannot measure a harness. At roughly 40% verifier
+losses a 300-task run would be dominated by infrastructure noise, and that noise
+is indistinguishable in the output from a harness genuinely failing tasks.
+
+Two designs were tested; only one is correct.
+
+**Rebuilding from the Dockerfile is not a valid substitute.** With
+`--force-build`, `break-filter-js-from-html` failed `test_out_html_bypasses_filter`
+-- a test the reference solution passes in the published image -- because the
+rebuild installs a different Chromium from Debian. Same tasks, two base choices:
+**1/5 from Dockerfile, 4/7 with the published images.** That is the argument for
+`--from-prebuilt`: base on the task's own `docker_image`, add only the warming
+layer.
+
+**The warming layer does remove the network dependency.** With it, the
+`break-filter-js-from-html` verifier reached and ran the tests with no download at
+all. The failures above are tasks that were *not* baked; that run used unmodified
+tasks.
+
+Honest summary: the adapter and apparatus are in place, but a valid baseline
+requires baking the whole task set and re-running oracle until it is essentially
+100%. Until that number exists, no harness comparison from this host means
+anything.
 ## Fixing the clone: a local mirror plus `insteadOf`
 
 Because Harbor re-clones on every run, and because the GitHub path proved
