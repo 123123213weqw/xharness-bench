@@ -51,12 +51,25 @@ Isolated by comparison:
 
 | WebKitGTK used | Result |
 | --- | --- |
-| the one bundled in the AppImage (Ubuntu 24.04 build) | EGL failure |
+| the one bundled in the AppImage (Ubuntu 22.04 build) | EGL failure |
 | the host's WebKitGTK 2.52.6 | renders correctly |
 
 The host's own EGL is healthy -- `eglGetDisplay`/`eglInitialize` succeed and
 report `Mesa Project 1.5`. The system `yelp`, which uses the host WebKitGTK,
 renders fine and spawns five WebKit processes.
+
+Where the incompatible stack comes from, verified at the release tag rather than
+on master: `scripts/desktop-release-build.py` defines the matrix as
+`'linux-x86_64-appimage': ('ubuntu-22.04', 'appimage')`, and
+`.github/workflows/desktop-release.yml` installs `libwebkit2gtk-4.1-dev` from
+that runner's apt. Tauri's bundler then packs it, along with the rest of the
+dependency closure, into the AppImage -- 165+ shared objects under `usr/lib/`.
+So the artifact ships a WebKitGTK/GTK3 stack built for Ubuntu 22.04, and it is
+that stack, not the host's, that aborts on Mesa 26.
+
+Checked with `git show desktop-v0.2.19:scripts/desktop-release-build.py` -- the
+same value, so this describes the artifact actually tested and not a later
+change.
 
 Standard workarounds were tried and **all failed**, each producing the identical
 two EGL errors: `WEBKIT_DISABLE_DMABUF_RENDERER=1`,
