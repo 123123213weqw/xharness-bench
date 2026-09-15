@@ -546,6 +546,93 @@ the uv toolchain removes the *dominant* per-trial download, but a generic egress
 path is still required, which is what the proxy provides. The two are
 complementary: baking cuts cost and repeat latency, the proxy covers the tail.
 
+## A fake-IP DNS mode silently breaks proxy nodes whose server is a hostname
+
+This cost more time than anything else in the proxy setup, and it is worth
+recording because every symptom pointed away from the cause.
+
+The proxy's DNS runs in `fake-ip` mode (`198.18.0.0/15`), which is normal and
+useful: it answers A queries with a synthetic address and maps it back on
+connect. One of the two nodes was defined with a **hostname** as its server
+(`jp.<ip>.nip.io`) rather than a raw address. So the node's own outbound
+connection was resolved through fake-IP, came back as `198.18.0.4`, and dialled a
+synthetic address that goes nowhere:
+
+```
+dial Proxies (match DomainSuffix/github.com) --> github.com:443
+  error: jp.<ip>.nip.io:443 connect error: dial tcp 198.18.0.4:443: i/o timeout
+```
+
+What made this expensive is how it presents:
+
+- the configuration **validates** (`mihomo -t` reports success),
+- the service **starts** and the RESTful API answers,
+- the *other* node — the one whose server is a raw IP — **tests healthy at 49 ms**,
+- and yet **every real request fails**, across HTTP and HTTPS, to every host.
+
+That combination reads as "the proxy is broken" or "the node is dead", and the
+tempting response is to change nodes or providers. The actual fix is one line:
+give the node a raw IP for `server` and keep the hostname only in `servername`
+and the WebSocket `Host` header, which is where SNI and virtual hosting need it.
+Adding the domain to `dns.fake-ip-filter` also works.
+
+**The generalisation:** in fake-IP mode, anything that must reach a *literal*
+address has to be excluded from synthetic resolution — proxy server addresses
+above all, since they are what every other connection depends on. A node given a
+hostname instead of an address is a time bomb that passes every check except the
+one that matters.
+
+## `ss | grep dockerd` is the wrong instrument once a proxy is in the way
+
+I concluded a 1.3 GB image pull had hung because:
+
+```
+ss -tnp | grep dockerd   ->  nothing
+```
+
+and left it running for eight minutes before re-checking. It was not hung. The
+daemon's sockets were to the local proxy, and the *proxy* held the upstream
+connection, so the daemon had nothing interesting to show. The authoritative view
+was the proxy's own connection table:
+
+```json
+{"metadata": {"host": "production.cloudfront.docker.com"},
+ "chains": ["东京-Trojan-抗封锁", "Proxies", "Final"],
+ "download": 20554835}
+```
+
+An actively growing download, invisible to the check I was using. The same
+reading error had already cost time earlier, when a pull through a registry
+mirror really *was* stalled — but I had no way to tell the two cases apart with
+that instrument, so I could not distinguish "slow" from "dead" either time.
+
+**The rule:** to judge whether traffic is flowing, read the connection table of
+the component that actually holds the connection. With a proxy in the path, that
+is the proxy, not the client.
+
+## Image pulls are a metered decision, so the two subscriptions are split
+
+Deduplicated across all 89 tasks, the task images total **41.5 GiB** — but four
+of them account for 28 GiB on their own (`mteb-leaderboard` and `mteb-retrieve`
+are 8.2 GiB each). Pulling that through a metered subscription would have
+exhausted the remaining allowance, and the choice is not an implementation
+detail once traffic is billed.
+
+The arrangement that follows:
+
+| Traffic | Path | Why |
+| --- | --- | --- |
+| task images (tens of GiB) | an unmetered node | volume would exhaust a metered allowance |
+| verifier downloads (tens of MiB per trial) | same unmetered node | small, but repeated |
+| fallback when the unmetered node fails | metered nodes | better to spend quota than to lose a trial |
+
+Registry mirrors were removed entirely rather than kept as a first choice. They
+were free, but a mirror that accepts a connection and then sends nothing blocks
+a pull indefinitely — Docker only falls back on an *error* — so "free but
+sometimes hangs" lost to "metered-but-unlimited and 2-9 MB/s". Measured on the
+same images through the unmetered node: one task image that had produced zero
+bytes in eight minutes over a mirror completed in **100 seconds**.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command

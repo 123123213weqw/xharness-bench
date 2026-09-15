@@ -32,6 +32,26 @@ optimistic.
 | The upstream SDK version matching `dsh-v0.1.0-rc.8` exists on PyPI | the Tier A upstream arm cannot be installed; resolve before running |
 | Terminal-Bench task images reach a package mirror | `setup()` would fail; a task set with vendored dependencies avoids this |
 
+## The verifier-network failure is fixed by egress, verified 4/4
+
+Four tasks that had *all* failed with verifier network errors -- with the
+reference solution applied -- were re-run **unmodified**, with working egress as
+the only change:
+
+| Task | Before | After | Verifier |
+| --- | --- | ---: | --- |
+| `db-wal-recovery` | verifier network failure | **1** | 7 passed |
+| `merge-diff-arc-agi-task` | verifier network failure | **1** | 5 passed |
+| `password-recovery` | verifier network failure | **1** | 2 passed |
+| `write-compressor` | verifier network failure | **1** | 3 passed |
+
+The verifier logs show `downloading uv 0.9.5` completing, and **zero** network
+errors in every one. That is the mechanism: the verifiers were never testing the
+agent, they were failing to fetch their own toolchain.
+
+So the earlier 4/8-on-the-oracle reading was an artifact of the host, not a
+property of the task set -- which is exactly why the oracle gate exists.
+
 ## The oracle gate has been exercised, and it failed
 
 Quantified on a full run over the published task images: **4 passed, 4 failed, of
