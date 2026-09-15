@@ -142,6 +142,107 @@ images then pull normally. Note the ordering trap: installing `docker.io` starts
 the daemon *before* the config is written, so the daemon must be restarted
 afterwards or the mirror is silently ignored.
 
+## Harbor needs the Docker Compose v2 plugin, which `docker.io` does not ship
+
+On Ubuntu 26.04, `apt-get install docker.io` provides the engine but **not** the
+`docker compose` subcommand. Harbor drives every task through compose, so every
+trial fails while the run as a whole still exits 0 -- the failure is only visible
+in the per-trial `RuntimeError` column:
+
+```
+docker compose --project-name <task>__env ... down --rmi local --volumes
+Return code: 125. Stdout: unknown flag: --project-name
+```
+
+Without the plugin, `compose` is not a known subcommand, so Docker parses
+`--project-name` as one of its own flags and rejects it. The message points at
+the flag rather than at the missing plugin, which makes it easy to misread as a
+Harbor bug.
+
+**Fix.** `apt-get install docker-compose-v2` (provides
+`/usr/libexec/docker/cli-plugins/docker-compose`). Verify with
+`docker compose version`.
+
+**Consequence for reading results.** A Harbor job can report exit status 0 with a
+`reward` of 0 for every trial. Always check the per-trial `exception_info`
+column: a run that "succeeded" with a uniform 0% is far more likely to be a
+broken environment than a uniformly hard task set. This is exactly the failure
+the `oracle` baseline exists to catch -- `nop` scoring 0 is expected, `oracle`
+scoring 0 never is.
+
+## Harbor re-clones the dataset on every run, with no cache
+
+`harbor/tasks/client.py` clones the dataset into
+`tempfile.TemporaryDirectory()` and copies the tasks it needs into
+`~/.cache/harbor/tasks/`. The clone itself is never cached, so every invocation
+depends on GitHub being reachable at that moment:
+
+```
+git clone --filter=blob:none --depth 1 --no-checkout \
+  https://github.com/laude-institute/terminal-bench-2.git <tmpdir>
+```
+
+One observed transient failure (`exit status 128`, with a `SYN-SENT` socket to
+GitHub that never completed) aborted a whole round; the identical command
+succeeded immediately afterwards, and an 82 MB full clone succeeded too. The
+`--filter=blob:none` partial clone is also why the error surfaces as a bare exit
+code rather than a legible network error.
+
+**Consequence.** Wrap `harbor run` in a retry loop. Note that the task *content*
+is cached under `~/.cache/harbor/tasks/`, so a retry only needs to survive the
+clone step; a local `git clone --mirror` plus
+`uploadpack.allowFilter=true` and a `url.<mirror>.insteadOf` redirect makes the
+step deterministic, and was verified to work with Harbor's exact clone arguments.
+
+**Also.** LiteLLM separately tries to fetch its model price map from
+`raw.githubusercontent.com` and times out on the same flaky path. It retries,
+falls back to a bundled backup, and is not fatal -- but it means cost data is
+unavailable rather than wrong, which is worth knowing before trusting a
+`cost_per_solved_task` column.
+
+## Task images are prebuilt and pull slowly through a mirror
+
+Each task declares a prebuilt image that Harbor pulls rather than builds:
+
+```toml
+docker_image = "alexgshaw/write-compressor:20251031"
+```
+
+Missing that image is not fatal on its own -- Harbor falls back to building from
+the task's `Dockerfile`, whose base is `python:3.13-slim-bookworm` or
+`ubuntu:24.04` -- but it does mean every trial first pays a registry pull. On the
+target host that pull exceeded Harbor's 600 s environment-start budget, and the
+run reported a uniform `Environment start timed out after 600.0 seconds` for 4 of
+5 tasks.
+
+Measured on the same host:
+
+| Path | Throughput |
+| --- | --- |
+| GitHub release tarball | ~1.55 MB/s |
+| `docker.m.daocloud.io` mirror | slow enough that a single task image did not finish in 240-300 s |
+
+So the bottleneck is the registry mirror, not the general network.
+
+**Consequence.** Pre-pull the task images before running. `docker pull` reuses
+already-downloaded layers, so retrying the same pull makes monotonic progress
+rather than starting over -- a retry loop converges even when one attempt times
+out. Once the images are local, environment start is fast and the 600 s budget is
+ample.
+
+**Worth noting for the write-up.** This is an infrastructure property of the
+measurement host, not of any harness. It must not be allowed to show up as a
+harness failure: an arm whose trials all die in environment setup has produced no
+evidence about the harness, and belongs in `harness_error`, never in the pass
+rate. The failure taxonomy in `report.py` exists partly so this distinction is
+machine-checkable rather than a matter of judgement.
+
+## Terminal-Bench task directories sit at the repository root
+
+`terminal-bench-2.git` stores each task as a top-level directory
+(`break-filter-js-from-html/`, `gpt2-codegolf/`, ...) with no enclosing `tasks/`
+directory, so a sparse-checkout path of `tasks` matches nothing.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command
