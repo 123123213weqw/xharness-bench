@@ -224,7 +224,12 @@ RUN set -eux; \\
 UV_BASE_IMAGE = "xh-uv-base:0.9.5"
 
 # Where the uv binaries live on the host. scripts/build-uv-base.sh writes here.
-UV_BIN_DIR = Path("/tmp/uvbin")
+#
+# Not under /tmp: on the reference host /tmp is a 6 GB tmpfs, and the warmed cache
+# that accompanies these binaries is several gigabytes. Writing it to /tmp fails
+# with EDQUOT -- a *quota* error that names no path, while `df -h /` reports plenty
+# of free space, because the check looks at the wrong filesystem.
+UV_BIN_DIR = Path.home() / "uvbin"
 
 _OFFLINE_LAYER = """# --- xharness_bench.prepare_tasks (offline bundle) --------------------------
 # uv and a warmed cache are copied from a shared base image, so this task image

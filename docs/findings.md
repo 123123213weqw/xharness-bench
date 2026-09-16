@@ -844,6 +844,34 @@ Two details that cost time:
   package is present, and on a host with no network that fails with a DNS error
   that looks like the cache is missing.
 
+## `/tmp` is a 6 GB tmpfs on this host, which silently capped the cache
+
+`EDQUOT` (os error 122) while warming `torch` reported *quota* exceeded with 348 GB
+free on the root filesystem. The cause was not a quota in the usual sense:
+
+```
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           6.0G  4.4G  1.6G  74% /tmp
+/dev/nvme0n1p2  468G   97G  348G  22% /
+```
+
+`/tmp` is a tmpfs, sized from RAM (the host has 11 GB), and the warmed cache had
+grown to 4.1 GB inside it. `torch` plus its CUDA dependencies are roughly 8 GB, so
+the warm could never have completed there.
+
+**Why this was hard to see.** The error names a quota, and the tool that reports it
+is a downloader -- so the natural reading is a network or registry limit. Disk
+space looked plentiful, because the check everyone runs (`df -h /`) reports the
+root filesystem, not the filesystem the file is actually being written to. The
+cache directory was also growing and shrinking between runs, which reads as
+flaky network behaviour: uv prunes a partially extracted package when the write
+fails, so a quota error looks like a download that keeps restarting.
+
+**Countermeasure.** The cache lives on the root filesystem now
+(`~/uvwarm/{cache,python}`), and anything sized in gigabytes is kept out of
+`/tmp`. The general point: `df -h /` is not a disk-space check for a path. Use
+`df -h <path>`, or `findmnt -T <path>`.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command
