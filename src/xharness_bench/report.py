@@ -18,6 +18,7 @@ here so the primary numbers can be reproduced without numpy/scipy.
 from __future__ import annotations
 
 import json
+import os
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -327,7 +328,17 @@ def load_harbor_jobs(root: Path) -> list[dict[str, Any]]:
     record, and stays tolerant of the surrounding layout.
     """
     rows: list[dict[str, Any]] = []
-    for path in sorted(root.glob("**/result.json")):
+    # os.walk with followlinks, not Path.glob("**/..."): glob does not descend
+    # through symlinks, so a results root assembled from symlinked arm directories
+    # -- the obvious way to compare two arms that Harbor wrote to separate paths --
+    # matches nothing and reports zero rows. That is indistinguishable from an empty
+    # run at the call site, which is the failure mode this loader was already fixed
+    # for once.
+    candidates: list[Path] = []
+    for directory, _subdirs, filenames in os.walk(root, followlinks=True):
+        if "result.json" in filenames:
+            candidates.append(Path(directory) / "result.json")
+    for path in sorted(candidates):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
