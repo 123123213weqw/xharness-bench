@@ -32,6 +32,41 @@ optimistic.
 | The upstream SDK version matching `dsh-v0.1.0-rc.8` exists on PyPI | the Tier A upstream arm cannot be installed; resolve before running |
 | Terminal-Bench task images reach a package mirror | `setup()` would fail; a task set with vendored dependencies avoids this |
 
+## Gate result: 44/57 with zero harness-side failures
+
+Run on a quiet host, with the cache bind-mounted and every task baked:
+
+| | count |
+| --- | ---: |
+| passed | **44** |
+| failed for task-side reasons | 10 |
+| failed for a cache gap in this setup | 3 |
+
+**Zero failures from verifier networking, uvx, or contention** -- which was the
+entire purpose of the baking and mounting work. Earlier attempts on the same task
+set scored 18.8% (contention), 7% (baked images silently unused) and 80.6%
+(overnight network outage), all of which were environmental.
+
+The 13 non-passing tasks, and why each is excluded or retried:
+
+| Task | Reason |
+| --- | --- |
+| `torch-tensor-parallelism`, `torch-pipeline-parallelism`, `mteb-retrieve` | the warmed cache lacks `torch`; being re-warmed and re-run |
+| `build-pmars` | Debian removed the pinned `dpkg-dev=1.22.21` |
+| `build-pov-ray` | the source URL returns 403 to direct and proxied requests alike |
+| `make-doom-for-mips` | Debian removed the pinned pool entries |
+| `build-cython-ext` | a test fails inside its vendored repository |
+| `caffe-cifar-10` | the model file is not produced by the reference solution |
+| `configure-git-webserver` | the reference solution's server does not come up |
+| `count-dataset-tokens` | the reference solution does not write `/app/answer.txt` |
+| `mcmc-sampling-stan` | the RStan/Stan check fails |
+| `fix-code-vulnerability` | its verifier uses plain `pip`, outside the uv cache |
+| `mailman` | its verifier uses `uv venv`, outside the uv cache; being warmed and re-run |
+
+Note that two of these are gaps in **this** setup rather than in the tasks: five
+verifiers use plain `pip` and one uses `uv venv`, and the baking only covers
+`uvx`. Those are being closed rather than blamed on the task set.
+
 ## Four tasks cannot pass the gate, and they are the tasks' fault
 
 Measured against a set published 2025-10-31: `build-pov-ray` (its source URL
