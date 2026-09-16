@@ -36,4 +36,10 @@ else
   echo "with-credentials: $credentials not found; running without credentials" >&2
 fi
 
+# Where the XHarness adapter caches the release bundle (the host binary plus the
+# static assets). Explicit rather than defaulted so a run never silently falls back
+# to downloading: a cache miss costs a slow network round trip and, on a host with
+# flaky egress, fails with a URLError that looks like a broken adapter.
+export XHARNESS_BENCH_CACHE="${XHARNESS_BENCH_CACHE:-$HOME/.cache/xharness-bench}"
+
 exec "$@"

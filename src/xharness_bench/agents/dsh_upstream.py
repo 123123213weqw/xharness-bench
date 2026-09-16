@@ -61,35 +61,67 @@ FROZEN_UPSTREAM_TAG = "dsh-v0.1.0-rc.8"
 # reads like a typo rather than a flag omission.
 NEAREST_INSTALLABLE_TO_FROZEN = "0.1.0rc7"
 
+# The endpoint the pinned provider talks to.
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+
 DRIVER = textwrap.dedent(
     '''
     """One-shot upstream Harness turn; prints a single JSON result object."""
-    import json, os, sys, time
-    from deepseek_harness import DeepSeekHarness
+    import inspect, json, os, sys, time
+
+    from deepseek_harness import DeepSeekHarness, DeepSeekHarnessConfig
 
     payload = json.loads(os.environ["BENCH_TURN"])
     started = time.monotonic()
+
+    # The SDK's configuration surface was reworked between the 0.1.0 series and
+    # 0.1.5. rc7 takes `session_root` and has no notion of a harness home; 0.1.5
+    # takes `dsh_home` and adds profiles and patches. Rather than pinning the
+    # adapter to one shape, build the kwargs from the installed Config's own
+    # signature -- so the arm can name whichever version is closest to the frozen
+    # contract revision without the adapter breaking on the difference.
+    fields = set(inspect.signature(DeepSeekHarnessConfig.__init__).parameters)
+    kwargs = {
+        "provider": payload["provider"],
+        "model": payload["model"],
+        "cwd": payload["cwd"],
+    }
+    if "dsh_home" in fields:
+        kwargs["dsh_home"] = payload["dsh_home"]
+    elif "session_root" in fields:
+        kwargs["session_root"] = payload["dsh_home"]
+    if payload.get("max_tokens"):
+        kwargs["max_tokens"] = payload["max_tokens"]
+    if payload.get("base_url"):
+        kwargs["base_url"] = payload["base_url"]
+    if payload.get("api_key"):
+        kwargs["api_key"] = payload["api_key"]
+    if "profile" in fields and payload.get("profile"):
+        kwargs["profile"] = payload["profile"]
+
+    shape = "dsh_home" if "dsh_home" in fields else (
+        "session_root" if "session_root" in fields else "unknown"
+    )
+
     result = {"ok": False}
     try:
-        with DeepSeekHarness(
-            dsh_home=payload["dsh_home"],
-            cwd=payload["cwd"],
-            provider=payload["provider"],
-            model=payload["model"],
-            **({"max_tokens": payload["max_tokens"]} if payload.get("max_tokens") else {}),
-        ) as harness:
+        with DeepSeekHarness(**kwargs) as harness:
             run = harness.run(payload["instruction"], session_id="bench-trial")
-        # RunResult exposes events and finish_reason, not usage. The token
-        # figures live inside the assistant/message event, which is the same
-        # place XHarness puts them -- so the shared parser reads both.
         result = {
             "ok": True,
+            "config_shape": shape,
+            "config_fields": sorted(fields),
             "final_response": run.final_response,
             "finish_reason": getattr(run, "finish_reason", None),
             "events": [e for e in (getattr(run, "events", None) or []) if isinstance(e, dict)],
         }
     except Exception as error:
-        result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+        result = {
+            "ok": False,
+            "config_shape": shape,
+            "config_fields": sorted(fields),
+            "error": f"{type(error).__name__}: {error}",
+        }
     result["elapsed_sec"] = round(time.monotonic() - started, 3)
     print(json.dumps(result))
     sys.exit(0 if result.get("ok") else 1)
@@ -108,6 +140,8 @@ class DshUpstreamAgent(BaseAgent):
         sdk_version: str | None = None,
         provider: str = "deepseek-official",
         max_tokens: int | None = None,
+        base_url: str | None = DEFAULT_BASE_URL,
+        profile: str | None = None,
         dsh_home: str = "/opt/dsh-home",
         turn_timeout_sec: int = 1800,
         **kwargs: Any,
@@ -116,6 +150,8 @@ class DshUpstreamAgent(BaseAgent):
         self._sdk_version = sdk_version
         self._provider = provider
         self._max_tokens = max_tokens
+        self._base_url = base_url
+        self._profile = profile
         self._dsh_home = dsh_home
         self._turn_timeout_sec = turn_timeout_sec
 
@@ -191,6 +227,8 @@ class DshUpstreamAgent(BaseAgent):
             "provider": self._provider,
             "model": self.model_name or "deepseek-v4-flash",
             "max_tokens": self._max_tokens,
+            "base_url": self._base_url,
+            "profile": self._profile,
         }
         api_key = (
             os.environ.get("DEEPSEEK_API_KEY")
@@ -234,6 +272,7 @@ class DshUpstreamAgent(BaseAgent):
             "turn_ok": result.get("ok"),
             "turn_error": result.get("error"),
             "finish_reason": result.get("finish_reason"),
+            "config_shape": result.get("config_shape"),
             "turn_end_reasons": summary["turn_end_reasons"],
             "turn_completed": summary["turn_completed"],
             "tool_calls": summary["tool_calls"],

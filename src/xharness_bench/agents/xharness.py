@@ -75,6 +75,16 @@ from ..rpc import (
 )
 
 DEFAULT_REPOSITORY = "123123213weqw/x-harness-rs"
+
+# The released desktop version this adapter was validated against. Pinned rather
+# than optional: a benchmark arm has to name the artifact it measured, and leaving
+# it unset also disables the cache fast path in prepare_bundle, so every trial
+# reaches for the release manifest and a host with unsteady egress dies with a
+# URLError that reads as a broken adapter.
+DEFAULT_VERSION = "0.2.19"
+
+# The endpoint the pinned provider talks to. Override per arm; recorded either way.
+DEFAULT_BASE_URL = "https://api.deepseek.com"
 INSTALL_DIR = "/opt/xharness"
 STATE_DIR = "/opt/xharness/state"
 
@@ -116,9 +126,20 @@ class XHarnessAgent(BaseAgent):
         self,
         *args: Any,
         repository: str = DEFAULT_REPOSITORY,
-        version: str | None = None,
+        # Pinned by default, and not optional in spirit. A benchmark arm has to name
+        # the artifact it measured, and leaving this None also disables the cache
+        # fast path in prepare_bundle -- so the adapter reaches for the release
+        # manifest on every trial and, on a host with unsteady egress, dies with a
+        # URLError that reads as a broken adapter rather than an unpinned arm.
+        version: str | None = DEFAULT_VERSION,
         provider: str = "deepseek",
-        base_url: str | None = None,
+        # Defaulted, not optional. With it unset the host falls back to its own
+        # default of http://127.0.0.1:8000/v1, which in a task container is nothing
+        # -- the first model call fails and the turn ends with reason "error" after
+        # a couple of seconds, with zero tokens and zero tool calls. That looks like
+        # an adapter bug rather than a missing endpoint, so it is defaulted here and
+        # recorded in the result row.
+        base_url: str | None = DEFAULT_BASE_URL,
         # Required by the host, not optional. With a configured model and no
         # context window, xharness-host refuses to start:
         #   Error: "configured models require a Provider/deployment context
@@ -142,10 +163,14 @@ class XHarnessAgent(BaseAgent):
         self._max_output_tokens = max_output_tokens
         self._extra_args = list(extra_args or [])
         self._turn_timeout_sec = turn_timeout_sec
+        # Durable location, not tempfile.gettempdir(): on the reference host /tmp is
+        # a 6 GB tmpfs, and a cache there is lost on reboot and competes with
+        # everything else that writes to /tmp. Override with XHARNESS_BENCH_CACHE or
+        # the cache_dir kwarg.
         self._cache_dir = Path(
             cache_dir
             or os.environ.get("XHARNESS_BENCH_CACHE")
-            or Path(tempfile.gettempdir()) / "xharness-bench-cache"
+            or Path.home() / ".cache" / "xharness-bench"
         )
         self._bundle: Bundle | None = None
         self._token: str | None = None
@@ -330,6 +355,7 @@ class XHarnessAgent(BaseAgent):
         ]
         if self.model_name:
             args += ["--model", self.model_name]
+        # Always passed; see the note on base_url in __init__.
         if self._base_url:
             args += ["--base-url", self._base_url]
         # Always passed; see the note on context_window in __init__.
@@ -454,6 +480,18 @@ class XHarnessAgent(BaseAgent):
         events = normalized_events(history)
         self._transcript = events
         self._populate_context(context, events, time.monotonic() - started)
+
+        # When a turn ends in "error" the reason alone rarely says why -- the host
+        # log does. Attaching its tail costs one exec and turns an opaque zero into
+        # something diagnosable from the result row.
+        reasons = (context.metadata or {}).get("turn_end_reasons") or []
+        if "completed" not in reasons:
+            _, tail = await self._exec(environment, f"tail -c 2000 {STATE_DIR}/host.log 2>/dev/null")
+            if tail.strip():
+                context.metadata = {**(context.metadata or {}), "host_log_tail": tail.strip()[-2000:]}
+            _, ready = await self._exec(environment, f"ls -la {STATE_DIR} 2>/dev/null | head -20")
+            if ready.strip():
+                context.metadata = {**(context.metadata or {}), "state_dir": ready.strip()}
 
 
     def _populate_context(
