@@ -143,6 +143,25 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T14: unequal output budgets between arms
+
+Both adapters defaulted their output cap to "whatever the implementation chooses",
+which is not a controlled quantity. In the first attempt at the comparison, two of
+three XHarness trials ended with `turn_end_reasons: ["max-tokens"]` after fewer than
+60 seconds and four tool calls, while the third completed normally. A truncated turn
+scores zero, so the arm with the smaller default loses trials for a reason that has
+nothing to do with the harness being compared.
+
+Both arms are now pinned to the same explicit budget (`max_output_tokens=32768` for
+XHarness, `max_tokens=32768` for the upstream SDK), the same context window, and the
+same agent timeout. The first three trials after pinning all completed with reason
+`completed` and no truncation.
+
+**The general point.** "Use each implementation's defaults" sounds neutral and is
+not: defaults are part of the implementation, they differ, and where they differ
+they decide trials. Any budget that can end a turn early has to be pinned across
+arms and recorded.
+
 ## T12 -- Measure one thing at a time: bulk transfers starve the verifiers
 
 This is the most expensive mistake made while building this, and it produced a
