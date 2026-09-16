@@ -766,6 +766,84 @@ The measurements above ran on 57 of 89 images, which is enough to freeze a task
 list and run the comparison; completing the image set is deferred rather than
 paid for out of a metered allowance that would not survive it.
 
+## Harbor ignores a baked Dockerfile when `task.toml` names an image
+
+The single most expensive mistake in this project, because it was invisible.
+
+Harbor's image selection, read from `environments/definition.py`:
+
+```python
+def should_use_prebuilt_docker_image(environment_dir, *, docker_image, force_build):
+    if not docker_image:
+        return False
+    if not force_build:
+        return True
+    return not (environment_dir / DOCKERFILE_NAME).exists()
+```
+
+A declared `docker_image` wins over the Dockerfile unless `--force-build` is
+passed. So baking 54 task images correctly, building all of them successfully,
+and running the gate produced:
+
+```
+4 passed / 53 failed   (7%)
+50 failures: "uvx: command not found"
+```
+
+Every one of those 54 images was **ignored**. Harbor ran the unmodified published
+image, which has no uv, and the verifier failed at its first line. The message
+looks like a network problem, the build log looks perfect, and the disk fills up
+with images nothing references -- which is the only visible clue, and an easy one
+to miss.
+
+`prepare_tasks.py` now rewrites `docker_image` in the copied `task.toml` to point
+at the baked image, and refuses to proceed if that rewrite does not apply to every
+task.
+
+**The general lesson:** when a tool has two ways to obtain the same resource, check
+which one it actually used rather than which one was prepared. A successful build
+is not evidence that the artifact was consumed.
+
+## Mounting the cache beats copying it, by a factor of twenty in disk
+
+`COPY --from` looks like it should deduplicate: the same cache copied into 57
+images ought to share one layer. It does not. Measured on two baked images:
+
+```
+break-filter 层数: 8   bn-fit-modify 层数: 8
+相同层数: 0
+```
+
+Zero shared layers, because each COPY creates a layer whose parent differs, so the
+layer digest differs. At ~2.8 GB of warmed cache per image, 57 tasks would have
+cost ~160 GB and left the host within 90 GB of full.
+
+Harbor supports bind mounts -- `--mounts` takes a JSON array of
+`{"type": "bind", "source", "target"}` -- and they reach the **verifier**
+container, not just the agent's. So the cache lives on the host and is mounted:
+
+```
+--mounts '[{"type":"bind","source":"/tmp/uvwarm/cache","target":"/root/.cache/uv"},
+           {"type":"bind","source":"/tmp/uvwarm/python",
+            "target":"/root/.local/share/uv/python","read_only":true}]'
+```
+
+| | copy the cache | mount the cache |
+| --- | ---: | ---: |
+| image size | 5.58 GB | **1.64 GB** |
+| build time | ~3 min | **8 s** |
+| 57-task disk cost | ~160 GB | ~9 GB |
+
+Two details that cost time:
+
+* The cache mount must be **read-write**. Read-only fails with
+  `failed to open file /root/.cache/uv/sdists-v9/.git: Read-only file system`,
+  because uv takes a lock inside its own cache directory. The cache is
+  content-addressed, so concurrent writers are safe.
+* `UV_OFFLINE=1` is required. Without it uv consults the index even when every
+  package is present, and on a host with no network that fails with a DNS error
+  that looks like the cache is missing.
+
 ## Trap: `pkill -f` over SSH kills the script that runs it
 
 `ssh host 'bash -s'` with `pkill -f xharness` matches the script's own command

@@ -223,6 +223,9 @@ RUN set -eux; \\
 # ``scripts/build-uv-base.sh``; every baked task copies from it.
 UV_BASE_IMAGE = "xh-uv-base:0.9.5"
 
+# Where the uv binaries live on the host. scripts/build-uv-base.sh writes here.
+UV_BIN_DIR = Path("/tmp/uvbin")
+
 _OFFLINE_LAYER = """# --- xharness_bench.prepare_tasks (offline bundle) --------------------------
 # uv and a warmed cache are copied from a shared base image, so this task image
 # needs NO network and NO package manager to grade.
@@ -247,14 +250,128 @@ COPY --from=%(base)s /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=%(base)s /usr/local/bin/uvx /usr/local/bin/uvx
 COPY --from=%(base)s /root/.cache/uv /root/.cache/uv
 COPY --from=%(base)s /root/.local/share/uv/python /root/.local/share/uv/python
+# Also install under /root/.local/bin, because the verifier scripts are written
+# against the official installer's layout: they run
+#     source $HOME/.local/bin/env
+# and then call a bare `uvx`. With uv only in /usr/local/bin that source line
+# fails and uvx is "not found" even though the binary is present and runnable --
+# which reads exactly like a network failure in the summary. Both locations are
+# populated so the scripts work whether or not they source that file.
+RUN mkdir -p /root/.local/bin \
+ && cp /usr/local/bin/uv /usr/local/bin/uvx /root/.local/bin/ \
+ && echo 'export PATH="/root/.local/bin:$PATH"' > /root/.local/bin/env \
+ && chmod 0755 /root/.local/bin/env /root/.local/bin/uv /root/.local/bin/uvx
 ENV UV_CACHE_DIR=/root/.cache/uv \
-    UV_PYTHON_INSTALL_DIR=/root/.local/share/uv/python
-RUN /usr/local/bin/uv --version \
- && /usr/local/bin/uvx --version \
- && %(warm)s
+    UV_PYTHON_INSTALL_DIR=/root/.local/share/uv/python \
+    PATH=/root/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN set -eux; \
+    /usr/local/bin/uv --version; \
+    /usr/local/bin/uvx --version; \
+    . /root/.local/bin/env; \
+    command -v uvx; \
+    %(warm)s
 # ---------------------------------------------------------------------------
 """
 
+
+
+def retarget_task_image(task_toml: Path, image: str) -> bool:
+    """Point the task at the baked image instead of the published one.
+
+    This is required, not cosmetic. Harbor chooses the published image whenever
+    ``task.toml`` declares one and ``--force-build`` is absent:
+
+        if not docker_image:  return False
+        if not force_build:   return True
+
+    So a baked Dockerfile is simply ignored, and the verifier runs in the
+    unmodified published image -- which has no uv. The resulting failure
+    ("uvx: command not found") looks like a network problem, and 50 tasks
+    reported exactly that while 54 correctly built images sat unused on disk.
+    """
+    if not task_toml.is_file():
+        return False
+    text = task_toml.read_text(encoding="utf-8")
+    new_text, count = re.subn(
+        r'^(\s*docker_image\s*=\s*)"[^"]*"',
+        lambda m: f'{m.group(1)}"{image}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if count == 0:
+        return False
+    task_toml.write_text(new_text, encoding="utf-8")
+    return True
+
+
+_MOUNT_LAYER = """# --- xharness_bench.prepare_tasks (mounted cache) ---------------------------
+# Only the uv binaries live in this image; the package cache and the Python
+# toolchain are bind-mounted at run time, so this image stays close to the size of
+# the task's published image.
+#
+# Why not COPY the cache in: COPY --from creates a fresh layer per image with no
+# cross-image deduplication, measured at 0 shared layers between two baked
+# images. The warmed cache is ~2.8 GB, so copying it into 57 tasks cost ~160 GB
+# and pushed the host to within 90 GB of full.
+#
+# The mounts must be supplied by the caller:
+#   harbor run ... --mounts '[{"type":"bind","source":CACHE,"target":"/root/.cache/uv"},
+#                             {"type":"bind","source":PYTHON,"target":"/root/.local/share/uv/python"}]'
+# UV_OFFLINE=1 in the verifier script makes uv read that cache instead of
+# resolving against the network.
+COPY uv uvx /usr/local/bin/
+RUN mkdir -p /root/.local/bin \
+ && cp /usr/local/bin/uv /usr/local/bin/uvx /root/.local/bin/ \
+ && echo 'export PATH="/root/.local/bin:$PATH"' > /root/.local/bin/env \
+ && chmod 0755 /root/.local/bin/env /root/.local/bin/uv /root/.local/bin/uvx \
+ && /usr/local/bin/uv --version \
+ && /usr/local/bin/uvx --version
+ENV UV_CACHE_DIR=/root/.cache/uv \
+    UV_PYTHON_INSTALL_DIR=/root/.local/share/uv/python \
+    PATH=/root/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+# ---------------------------------------------------------------------------
+"""
+
+
+
+def stage_uv_binaries(environment_dir: Path, uv_bin_dir: Path) -> None:
+    """Copy the uv binaries into a task's build context.
+
+    Hard links where possible: the binaries are ~53 MB, and the build context is
+    on the same filesystem, so this costs no disk and no measurable time.
+    """
+    import os
+
+    for name in ("uv", "uvx"):
+        source = uv_bin_dir / name
+        if not source.is_file():
+            continue
+        destination = environment_dir / name
+        if destination.exists():
+            continue
+        try:
+            os.link(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
+        destination.chmod(0o755)
+
+def dockerfile_mounted_cache(original: str, base_image: str) -> str:
+    """Base on the published image; add only the uv binaries."""
+    preserved = "\n".join(
+        f"# {line}" if line.strip() else "#" for line in original.rstrip("\n").splitlines()
+    )
+    header = f"""# Generated by xharness_bench.prepare_tasks --from-prebuilt --mount-cache.
+#
+# Base is the task's published image, so the environment is exactly what the task
+# author validated. The original Dockerfile is reproduced below as comments.
+#
+# uv is added; the package cache is mounted, not copied. The tests are unmodified.
+FROM {base_image}
+
+{preserved}
+"""
+    return header + _MOUNT_LAYER
 
 def dockerfile_offline(original: str, base_image: str, spec: UvxSpec) -> str:
     """Base on the published image and add a network-free uv layer."""
@@ -325,6 +442,7 @@ class PatchRecord:
     test_sh_changed: bool
     base_image: str | None = None
     base_mode: str = "dockerfile"
+    baked_image: str | None = None
     skipped: str | None = None
 
 
@@ -335,6 +453,7 @@ def prepare_task(
     dry_run: bool = False,
     from_prebuilt: bool = False,
     offline: bool = False,
+    mount_cache: bool = False,
 ) -> PatchRecord:
     """Copy one task and bake its verifier dependencies."""
     dockerfile = task_dir / "environment" / "Dockerfile"
@@ -385,7 +504,12 @@ def prepare_task(
     (target / "tests" / "test.sh").write_text(new_test, encoding="utf-8")
 
     original = dockerfile.read_text(encoding="utf-8", errors="replace")
-    if offline:
+    if mount_cache:
+        if not prebuilt:
+            record.skipped = "mount-cache mode requires a published docker_image"
+            return record
+        new_docker = dockerfile_mounted_cache(original, prebuilt)
+    elif offline:
         if not prebuilt:
             record.skipped = "offline mode requires a published docker_image"
             return record
@@ -397,8 +521,23 @@ def prepare_task(
     (target / "environment" / "Dockerfile").write_text(new_docker, encoding="utf-8")
     (target / "environment" / "Dockerfile").chmod(0o644)
 
+    if mount_cache:
+        record.base_mode = "prebuilt-mount-cache"
     if offline:
         record.base_mode = "prebuilt-offline"
+    if mount_cache or offline:
+        stage_uv_binaries(target / "environment", UV_BIN_DIR)
+        # Harbor prefers a declared docker_image over the Dockerfile:
+        #     if not docker_image:  return False
+        #     if not force_build:   return True
+        # so a baked Dockerfile is ignored unless task.toml names the baked image.
+        # Getting this wrong is invisible in the build log and surfaces only as
+        # "uvx: command not found" at grading time, which reads like a network
+        # fault -- it cost a full 57-task gate run to find.
+        record.baked_image = f"xh-baked/{task_dir.name}:latest"
+        if not retarget_task_image(target / "task.toml", record.baked_image):
+            record.skipped = "no docker_image in task.toml to retarget"
+            return record
 
     record.dockerfile_sha256_after = sha256_file(target / "environment" / "Dockerfile")
     record.test_sh_sha256_after = sha256_file(target / "tests" / "test.sh")
@@ -409,6 +548,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--mount-cache",
+        action="store_true",
+        help=(
+            "put only the uv binaries in the image and bind-mount the warmed "
+            "cache at run time. Preferred over --offline: COPY --from does not "
+            "deduplicate across images, so copying a 2.8 GB cache into every "
+            "task costs about 160 GB."
+        ),
+    )
     parser.add_argument("--uv-version", default="0.9.5")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--only", nargs="*", help="restrict to these task names")
@@ -449,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             from_prebuilt=args.from_prebuilt,
             offline=args.offline,
+            mount_cache=args.mount_cache,
         )
         for task in candidates
     ]
@@ -461,6 +611,12 @@ def main(argv: list[str] | None = None) -> int:
         by_mode[record.base_mode] = by_mode.get(record.base_mode, 0) + 1
     for mode, count in sorted(by_mode.items()):
         print(f"  base={mode}: {count}")
+    retargeted = [r for r in patched if r.baked_image]
+    if retargeted:
+        print(
+            f"  task.toml retargeted to the baked image: {len(retargeted)} "
+            "(required -- Harbor prefers a declared docker_image over the Dockerfile)"
+        )
     only_dockerfile = [r for r in patched if r.base_mode == "dockerfile"]
     if only_dockerfile:
         print(
