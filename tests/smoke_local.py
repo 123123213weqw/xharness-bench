@@ -378,6 +378,50 @@ def check_tool_breakdown() -> list[tuple[str, bool]]:
         ("dispatch is not a call", dispatch["tool_calls"] == 0),
         ("no calls reports empty breakdown", summarize_events([])["tool_calls_by_name"] == {}),
         ("no calls reports zero bytes", summarize_events([])["tool_result_bytes"] == 0),
+    ] + check_durable_shape()
+
+
+def check_durable_shape() -> list[tuple[str, bool]]:
+    """The same events, read from the durable session log, must parse the same way.
+
+    There are three shapes and this is the third: the wire projection both arms emit is
+    flat camelCase, the durable log nests under ``call`` and ``result``, and the version
+    this module first assumed exists nowhere. Each one was found by rendering a real
+    session and seeing a field come back empty, so each one now has a fixture.
+
+    Concretely, a durable ``tool/call`` is
+    ``{"data": {"call": {"id": ..., "name": ..., "arguments_json": ...}}}`` and its
+    result is ``{"data": {"result": {"call_id": ..., "content": ...}}}`` -- the arguments
+    and the identity are one level deeper than on the wire.
+    """
+    from xharness_bench.rpc import (
+        summarize_events,
+        tool_call_arguments,
+        tool_call_id,
+        tool_result_call_id,
+    )
+
+    fixture = Path(__file__).resolve().parent / "fixtures" / "real-session-durable.json"
+    if not fixture.exists():
+        return [("durable session fixture is present", False)]
+    captured = json.loads(fixture.read_text(encoding="utf-8"))
+    summary = summarize_events(captured)
+
+    calls = [e for e in captured if e.get("type") == "tool/call"]
+    results = [e for e in captured if e.get("type") == "tool/result"]
+    first_call = calls[0]["data"] if calls else {}
+    first_result = results[0]["data"] if results else {}
+    return [
+        ("durable fixture present", len(calls) == 4 and len(results) == 4),
+        ("durable calls counted", summary["tool_calls"] == 4),
+        ("durable results counted", summary["tool_results"] == 4),
+        ("durable names recovered",
+         summary["tool_calls_by_name"] == {"bash": 3, "read": 1}),
+        ("durable bytes summed", summary["tool_result_bytes"] == 23410),
+        ("durable call id found", tool_call_id(first_call).startswith("xh-")),
+        ("durable arguments found", bool(tool_call_arguments(first_call))),
+        ("durable result link found",
+         tool_result_call_id(first_result) == tool_call_id(first_call)),
     ]
 
 

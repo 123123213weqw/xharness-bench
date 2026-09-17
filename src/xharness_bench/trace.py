@@ -18,7 +18,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .rpc import tool_call_name, tool_result_text
+from .rpc import (
+    tool_call_arguments,
+    tool_call_id,
+    tool_call_name,
+    tool_result_call_id,
+    tool_result_text,
+)
 
 # Where Harbor looks. Not configurable on purpose: a convention that can drift is not a
 # convention, and the trial record already points at this path.
@@ -101,24 +107,17 @@ def render_trace(
             # how the first version of this renderer printed "?" for every tool name:
             # the wire is flat camelCase, not the nested shape the Rust enum implies.
             name = tool_call_name(data) or "?"
-            call_id = data.get("callId") or data.get("call_id") or data.get("id")
+            call_id = tool_call_id(data)
             if call_id:
-                tool_names[str(call_id)] = name
-            arguments = data.get("arguments") or data.get("arguments_json")
-            lines.append(f"{where:<8} CALL      {name}  {_arguments(arguments)}")
+                tool_names[call_id] = name
+            lines.append(f"{where:<8} CALL      {name}  {_arguments(tool_call_arguments(data))}")
         elif kind == "tool/result":
             content = tool_result_text(data)
             size = len(content.encode("utf-8", "replace"))
             result = data.get("result") if isinstance(data.get("result"), dict) else {}
-            call_id = None
-            message = data.get("message")
-            if isinstance(message, dict):
-                source = message.get("source")
-                if isinstance(source, dict):
-                    call_id = source.get("callId") or source.get("call_id")
-            call_id = call_id or result.get("call_id")
-            name = tool_names.get(str(call_id), "?") if call_id else "?"
-            failed = " [error]" if (result.get("outcome") == "error") else ""
+            call_id = tool_result_call_id(data)
+            name = tool_names.get(call_id, "?") if call_id else "?"
+            failed = " [error]" if result.get("outcome") == "error" else ""
             lines.append(f"{where:<8} result    {name} {size}B{failed}  {_clip(content)}")
         elif kind == "turn/end":
             reason = data.get("reason") if isinstance(data.get("reason"), dict) else {}

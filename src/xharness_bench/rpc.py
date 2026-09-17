@@ -266,6 +266,59 @@ def tool_call_name(data: dict[str, Any]) -> str:
     return ""
 
 
+def _nested(data: dict[str, Any], *keys: str) -> Any:
+    """First present, non-empty value at ``data[key]`` or ``data.call[key]``."""
+    call = data.get("call") if isinstance(data.get("call"), dict) else {}
+    for source in (data, call):
+        for key in keys:
+            value = source.get(key) if isinstance(source, dict) else None
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def tool_call_id(data: dict[str, Any]) -> str:
+    """The invocation's identity, from any of the three shapes in play.
+
+    There are three, which is the whole difficulty. The durable session log nests under
+    ``call`` (``{"call": {"id": ..., "name": ..., "arguments_json": ...}}``); the
+    projected event both arms emit on the wire is flat (``{"name": ..., "callId": ...,
+    "arguments": ...}``); and this module's first version assumed a third that does not
+    exist. Each was discovered by rendering a real session and seeing ``?`` where a name
+    belonged.
+    """
+    value = _nested(data, "callId", "call_id", "id")
+    return str(value) if value else ""
+
+
+def tool_call_arguments(data: dict[str, Any]) -> Any:
+    """The arguments, as a JSON string or a mapping, from either shape."""
+    return _nested(data, "arguments", "arguments_json")
+
+
+def tool_result_call_id(data: dict[str, Any]) -> str:
+    """Which invocation a result answers, from either shape."""
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    for source in (result, data):
+        for key in ("call_id", "callId"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if value:
+                return str(value)
+    message = data.get("message")
+    if isinstance(message, dict):
+        source = message.get("source")
+        if isinstance(source, dict):
+            for key in ("callId", "call_id"):
+                if source.get(key):
+                    return str(source[key])
+        for part in message.get("content") or []:
+            if isinstance(part, dict):
+                for key in ("toolCallId", "tool_call_id"):
+                    if part.get(key):
+                        return str(part[key])
+    return ""
+
+
 def tool_result_text(data: dict[str, Any]) -> str:
     """The text a tool handed back, from either shape.
 
