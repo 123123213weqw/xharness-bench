@@ -143,6 +143,49 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T24: the verifier needs network, and its absence is not visible in the result
+
+Task verifiers run `apt-get install` before their tests. In 62 trials across both arms the
+install failed:
+
+```
+Err:1 http://deb.debian.org/debian bookworm InRelease
+  Could not connect to deb.debian.org:http:
+E: Unable to locate package curl
+```
+
+39 of those 62 still passed, so for most tasks the missing package is incidental -- the
+verifier installs a tool it does not end up needing. But the failure is silent in the
+result: a task that fails *because* its verifier could not install something is recorded
+as an ordinary `0.0`, indistinguishable from an agent that got the answer wrong. The
+`test-stdout.txt` is the only place the cause appears.
+
+Affected both arms roughly equally (21 / 21 / 19 / 1 across the four run directories), so
+it is not a bias between them -- it is noise that inflates the failure count on both
+sides and shrinks the discriminating set further (T23).
+
+**A near-miss while diagnosing this.** The first measurement said containers could not
+reach the proxy at all, because the check was `(echo > /dev/tcp/$ip/7890)` run through
+`sh`. That construct is a bash feature; dash does not implement it, so it fails for every
+address and reports a total network outage that does not exist. Re-tested with a socket
+from Python: `172.20.0.1:7890` reachable, and direct connections to `deb.debian.org:80`
+and `pypi.org:443` both succeed. The false alarm was one command away from being written
+up as a finding, and the pattern is the same one as T19, T21 and T22 -- a check whose
+failure mode looks like the thing it is checking for.
+
+**One task's timeout is the agent's own doing.** `model-extraction-relu-logits` ended with
+`Verifier execution timed out after 1800.0 seconds`. Its verifier re-runs the agent's
+script to prevent reward hacking:
+
+```python
+os.popen("python3 /app/steal.py").read()
+```
+
+The script the agent left behind hangs when re-run, which the live container confirms:
+`/app/steal.py` is still consuming CPU long after the agent's turn ended. The re-run
+exists to stop a solution that hard-codes the answer; it also, correctly, fails a solution
+that only works once.
+
 ## T23: most of the task set cannot discriminate, and the gate guaranteed that
 
 The 47-task set was filtered by requiring the oracle to pass three times, which removes
