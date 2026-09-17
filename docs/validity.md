@@ -143,6 +143,51 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T15: the oracle gate and the comparison have different load profiles
+
+The gate that validated the task set ran the oracle, which runs the reference
+solution and exits. The verifier then has the box largely to itself. The comparison
+runs two LLM agents that work for minutes at a time, so the verifier contends with
+them. Passing the gate therefore does not establish that a task can *register* a
+harness difference under the conditions the comparison runs in.
+
+This is not hypothetical. Five of the 47 frozen tasks assert on wall-clock time, and
+one of them failed in the first comparison run for that reason:
+
+```python
+assert dt < ref_dt, f"{dt:.6f} seconds/call > {ref_dt:.6f} seconds/call"
+```
+
+`largest-eigenval` compares the median runtime of the candidate against the median
+runtime of the reference, with no margin, over matrices small enough that both sides
+are measured in microseconds. On an idle host it passes -- verified three times in a
+row, and it passed the gate. Under two concurrent trials it failed at 12 to 25
+microseconds, which is noise dominating the comparison rather than a difference in
+the candidate.
+
+The same task's verifier has been observed failing the oracle once at 0.000019 s and
+passing three consecutive times afterwards, so the instability is in the task, not in
+either arm.
+
+**Control.** `scripts/oracle-control.sh` runs the oracle over the frozen set with the
+comparison's own flags -- same mounts, same timeouts, same `-n` -- and costs no
+tokens. Any task the oracle fails there cannot have a harness difference attributed
+to it, and is reported separately rather than folded into a pass rate.
+
+The five timing-sensitive tasks, found by grepping the frozen set's verifiers for
+`elapsed|perf_counter|time.time|duration|speedup|timeit|benchmark`:
+
+```
+cancel-async-tasks            2
+constraints-scheduling        1
+largest-eigenval              4
+make-mips-interpreter         2
+schemelike-metacircular-eval  2
+```
+
+These are not excluded a priori. Excluding them on suspicion would be its own
+distortion; the control decides, per task, with evidence.
+
 ## T14: unequal output budgets between arms
 
 Both adapters defaulted their output cap to "whatever the implementation chooses",
