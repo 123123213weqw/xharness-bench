@@ -143,6 +143,46 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T23: most of the task set cannot discriminate, and the gate guaranteed that
+
+The 47-task set was filtered by requiring the oracle to pass three times, which removes
+anything unsolvable or ambiguously specified -- correctly, since a task nobody can pass
+tells you nothing. The consequence is a set whose ceiling is low, and it shows in the
+paired result:
+
+```
+both pass     26 / 37     70%
+both fail      6 / 37     16%
+discriminating 5 / 37     14%
+```
+
+**86% of the tasks contributed nothing to the comparison.** The effective sample size is
+5 discordant pairs, not 37 tasks, and the binomial machinery in report.py operates on the
+5.
+
+This is the third distinct reason the comparison is underpowered, and they compound:
+
+1. **T-set size.** 194 tasks are needed for a 10-point difference at 80% power. There are
+   47.
+2. **Discriminating fraction.** Of those 47, 14% separate the arms, so the usable count is
+   nearer 6 than 47.
+3. **The budget defect (T16).** For most of the run the arms were not given the same
+   context, which pushed failures into a category that says nothing about either harness.
+
+The first two are properties of the task set and could be fixed by using one written for a
+narrower skill gap -- a set where a strong agent scores near 100% and a weak one near 0%
+would need far fewer tasks, but would only measure large differences, which is the
+opposite of what a fidelity check wants.
+
+**What this forbids.** Reporting "74.5% vs 75.7%" as a result. The honest form is the
+paired table plus the discordant count plus the power statement, which is what
+docs/results.md does.
+
+**What it permits.** Statements about cost, which are not subject to the same problem:
+XHarness's median trial is 2.4x longer (470s against 195s) and its prompt per step is
+2-3x larger. Those are 2-3x effects measured on 37 paired samples, not 2-point effects
+measured on 5.
+
 ## T22: a test written from the same assumption as the code certifies the assumption
 
 The tool measurement added for T21 was wrong for both arms, and the smoke test passed.
