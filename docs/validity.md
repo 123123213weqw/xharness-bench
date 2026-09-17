@@ -143,6 +143,58 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T16: the two harnesses do not mean the same thing by "context window"
+
+Reading the failure composition of the 47x2 run showed a clean threshold. Cumulative
+reasoning tokens per trial:
+
+| outcome | reasoning tokens (~) |
+| --- | --- |
+| completed (7 trials) | 2,100 to 14,600 |
+| `error` (5 trials) | 30,300 to 42,900 |
+| `max-tokens` (2 trials) | 98,400 and 109,500 |
+
+and the boundary sits exactly at the output budget the run was pinned to. The host's
+own error says why, once it is asked:
+
+```
+invalid token budget: output reserve (131072) plus safety margin (1024)
+must be smaller than context window (131072)
+```
+
+So in XHarness, `--max-output-tokens` is not an output cap beside the context
+window; it is **carved out of** it. A request is refused when the remaining input
+budget cannot hold the conversation, the host attempts compaction, and if that
+cannot help the turn ends as a budget failure rather than a task failure.
+
+Then the two defaults were measured rather than assumed:
+
+| | declared capacity for `deepseek-v4-flash` |
+| --- | --- |
+| upstream dsh (runtime shipped config) | `contextWindow: 128e3` |
+| XHarness (own model profile) | `fallback_context_window_tokens: 1000000` |
+| the model itself | at least 1,000,000 (1,000,031 input accepted, no error) |
+
+Neither harness ships the model's real capacity, they disagree with each other by
+8x, and the same flag name means different things on each side. `max_tokens` on
+upstream is an output cap; `--max-output-tokens` on XHarness is a claim on the
+context.
+
+**What was done about it.** The smaller of the two declared capacities is used, so
+neither arm gets more room than the other: 128,000 for both. That this happens to be
+close to the 131,072 the run had been using is luck, not design -- the earlier value
+came from an unverified comment.
+
+Both arms emit `request/context` carrying the `contextWindow` they actually ran
+with, so the effective value is now read back per trial instead of assumed from the
+flags. Assuming it is what produced this threat in the first place.
+
+**What is still not equalised.** XHarness reserves its output budget out of the
+window and the upstream reserve semantics are not documented anywhere reachable, so
+the two arms' *effective input* budgets are probably not identical even at the same
+declared window. This is reported rather than silently normalised: the effective
+numbers are in every result row, and any conclusion is stated against them.
+
 ## T15: the oracle gate and the comparison have different load profiles
 
 The gate that validated the task set ran the oracle, which runs the reference

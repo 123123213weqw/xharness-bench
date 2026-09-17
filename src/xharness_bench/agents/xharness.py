@@ -141,14 +141,22 @@ class XHarnessAgent(BaseAgent):
         # an adapter bug rather than a missing endpoint, so it is defaulted here and
         # recorded in the result row.
         base_url: str | None = DEFAULT_BASE_URL,
-        # Required by the host, not optional. With a configured model and no
-        # context window, xharness-host refuses to start:
-        #   Error: "configured models require a Provider/deployment context
-        #           capability or an explicitly labelled
-        #           fallback_context_window_tokens value"
-        # Verified against the shipped binary. Pin it per arm so both arms run
-        # the same budget.
-        context_window: int = 65536,
+        # The host refuses to start without an explicit window whenever a model is
+        # configured and no provider deployment file supplies the capability, so
+        # this cannot be left unset. The value is 128_000 to match what the upstream
+        # harness ships for the same model -- its runtime declares
+        # `contextWindow: 128e3` -- so that both arms are granted the same model
+        # capacity and a difference between them is not a difference in room.
+        #
+        # Neither number is the model's real limit. deepseek-v4-flash accepts at
+        # least 1_000_000 input tokens (measured: 1_000_031 accepted, no error), and
+        # the XHarness model profile itself declares
+        # `fallback_context_window_tokens: 1000000`. Pinning XHarness to its own
+        # profile value while upstream stays at 128e3 would hand one arm eight times
+        # the room, so the smaller of the two declared capacities is used instead,
+        # and the effective value each arm actually ran with is recorded per trial
+        # from its own `request/context` event.
+        context_window: int = 128000,
         max_output_tokens: int | None = None,
         extra_args: list[str] | None = None,
         turn_timeout_sec: int = 1800,
@@ -561,6 +569,7 @@ class XHarnessAgent(BaseAgent):
             "tool_calls": summary["tool_calls"],
             "turn_end_reasons": summary["turn_end_reasons"],
             "turn_end_errors": summary.get("turn_end_errors") or [],
+            "effective_context_window": summary.get("effective_context_window"),
             # "completed" is the clean finish; anything else (e.g. "error") means
             # the harness itself failed, which is not evidence about the model or
             # the task.

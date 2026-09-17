@@ -300,6 +300,7 @@ class DshUpstreamAgent(BaseAgent):
             "config_shape": result.get("config_shape"),
             "turn_end_reasons": summary["turn_end_reasons"],
             "turn_end_errors": summary.get("turn_end_errors") or [],
+            "effective_context_window": summary.get("effective_context_window"),
             "turn_completed": summary["turn_completed"],
             "tool_calls": summary["tool_calls"],
             # Recorded so a result row always says which upstream it measured.

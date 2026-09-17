@@ -268,6 +268,13 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     cache_read = cache_write = reasoning = 0
     total_reported = 0
     tool_calls = 0
+    # What the harness actually ran with, read back from its own events rather than
+    # assumed from the flags we passed. The two implementations do not mean the same
+    # thing by "context window": on this model the upstream shipped config declares
+    # 128e3 while the XHarness model profile declares 1_000_000, and either may
+    # narrow the value it is given. Recording the effective number is the only way a
+    # reader can tell whether the arms were granted comparable room.
+    effective_context_window: int | None = None
     answers: list[str] = []
     reasons: list[str] = []
     errors: list[str] = []
@@ -277,6 +284,11 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         data = event.get("data") or {}
         if not isinstance(data, dict):
             continue
+
+        if kind == "request/context":
+            window = data.get("contextWindow") or data.get("context_window")
+            if isinstance(window, int) and window > 0:
+                effective_context_window = window
 
         if kind in ("assistant/message", "message/assistant"):
             usage = data.get("usage")
@@ -336,6 +348,7 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "turn_end_reasons": reasons,
         # The provider's own message for any turn that ended in "failed".
         "turn_end_errors": errors,
+        "effective_context_window": effective_context_window,
         # "completed" is the clean finish. Anything else means the harness itself
         # failed, which is not evidence about the model or the task.
         "turn_completed": "completed" in reasons,
