@@ -47,6 +47,8 @@ from harbor.models.agent.context import AgentContext
 
 from ..rpc import exec_parts, summarize_events
 
+SDK_PACKAGE = "deepseek-harness-sdk"
+
 FROZEN_CONTRACT_REVISION = "deepseek-harness@141eb6fef8"
 FROZEN_UPSTREAM_TAG = "dsh-v0.1.0-rc.8"
 
@@ -61,8 +63,89 @@ FROZEN_UPSTREAM_TAG = "dsh-v0.1.0-rc.8"
 # reads like a typo rather than a flag omission.
 NEAREST_INSTALLABLE_TO_FROZEN = "0.1.0rc7"
 
+# Passing this as ``sdk_version`` resolves the newest release from PyPI at setup
+# time instead of using the pin above. It exists because the pin is a constant, and
+# a constant is how the comparison ended up measuring a revision 16 tags behind
+# upstream without saying so: moving it forward was an edit somebody had to remember
+# to make.
+#
+# Resolution fails loudly rather than falling back. If the newest release is not in
+# the warmed cache the offline install fails, and the error names the version and the
+# command that would cache it -- which is the correct outcome. A silent fall back to
+# the pin would produce a run labelled "latest" that was not, which is the exact
+# failure this constant is meant to end.
+LATEST = "latest"
+
+# PyPI's JSON index. Only reached when ``LATEST`` is requested.
+PYPI_JSON = "https://pypi.org/pypi/{package}/json"
+
 # The endpoint the pinned provider talks to.
 DEFAULT_BASE_URL = "https://api.deepseek.com"
+
+
+def resolve_sdk_version(requested: str | None) -> str:
+    """Turn a requested version into one that can be provisioned.
+
+    ``LATEST`` asks PyPI; anything else is returned unchanged. Deliberately no
+    fallback: a run that says "latest" and quietly provisions an older release is
+    worse than one that fails.
+
+    Module-level rather than a method so ``scripts/warm-sdk-cache.sh`` resolves the
+    same way the adapter does. Two copies of this rule would drift apart, and that
+    script exists precisely to keep the cache in step with what a run will ask for.
+    """
+    requested = requested or NEAREST_INSTALLABLE_TO_FROZEN
+    if requested != LATEST:
+        return requested
+
+    import json as _json
+    import re
+    import urllib.error
+    import urllib.request
+
+    url = PYPI_JSON.format(package=SDK_PACKAGE)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            payload = _json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise RuntimeError(
+            f"sdk_version='latest' needs to read {url} and could not: {error}. "
+            f"Pass an explicit version instead, e.g. --ak sdk_version="
+            f"{NEAREST_INSTALLABLE_TO_FROZEN}."
+        ) from error
+
+    candidates = [v for v in (payload.get("releases") or {}) if v]
+    if not candidates:
+        raise RuntimeError(f"{url} listed no releases for {SDK_PACKAGE}")
+
+    # Every release of this package is a pre-release, so the newest is the highest
+    # PEP 440 version rather than whatever the index lists last. packaging is used
+    # when available and a numeric-tuple sort otherwise, so a missing optional
+    # dependency degrades to a slightly cruder ordering instead of raising in the
+    # middle of a run. Confirmed necessary: the system python on the runner has no
+    # packaging, and the first version of the warm script returned an empty string
+    # there.
+    try:
+        from packaging.version import InvalidVersion, parse
+
+        usable = []
+        for value in candidates:
+            try:
+                usable.append((parse(value), value))
+            except InvalidVersion:
+                continue
+        if not usable:
+            raise RuntimeError(f"no parseable version in {url}")
+        return max(usable)[1]
+    except ImportError:
+        def sort_key(value: str) -> tuple:
+            numbers = tuple(int(part) for part in re.findall(r"\d+", value))
+            # A suffixed release (rc/a/b/dev) precedes the final release of the same
+            # numbers, so it sorts lower.
+            return (numbers, 0 if re.search(r"[a-zA-Z]", value) else 1)
+
+        return max(candidates, key=sort_key)
+
 
 DRIVER = textwrap.dedent(
     '''
@@ -148,6 +231,10 @@ class DshUpstreamAgent(BaseAgent):
     ) -> None:
         super().__init__(*args, **kwargs)
         self._sdk_version = sdk_version
+        # Filled by _resolve_version: the version actually provisioned, which is
+        # what every result row records. Holding it separately from the request
+        # means "latest" never reaches a result row unresolved.
+        self._resolved_version: str | None = None
         self._provider = provider
         self._max_tokens = max_tokens
         self._base_url = base_url
@@ -162,7 +249,11 @@ class DshUpstreamAgent(BaseAgent):
 
     @override
     def version(self) -> str | None:
-        return self._sdk_version or FROZEN_UPSTREAM_TAG
+        return self._resolved_version or self._sdk_version or FROZEN_UPSTREAM_TAG
+
+    def _resolve_version(self) -> str:
+        """The version this agent will provision."""
+        return resolve_sdk_version(self._sdk_version)
 
     async def _exec(
         self, environment: BaseEnvironment, command: str, **kwargs: Any
@@ -171,9 +262,9 @@ class DshUpstreamAgent(BaseAgent):
 
     @override
     async def setup(self, environment: BaseEnvironment) -> None:
-        spec = "deepseek-harness-sdk"
-        version = self._sdk_version or NEAREST_INSTALLABLE_TO_FROZEN
-        spec = f"{spec}=={version}"
+        version = self._resolve_version()
+        self._resolved_version = version
+        spec = f"{SDK_PACKAGE}=={version}"
         # Provision through uv, not `python3 -m venv` plus pip.
         #
         # The previous version guarded the install with
@@ -324,7 +415,7 @@ class DshUpstreamAgent(BaseAgent):
             # Recorded so a result row always says which upstream it measured.
             "contract_revision": FROZEN_CONTRACT_REVISION,
             "frozen_tag": FROZEN_UPSTREAM_TAG,
-            "sdk_version": self._sdk_version or NEAREST_INSTALLABLE_TO_FROZEN,
+            "sdk_version": self._resolved_version or NEAREST_INSTALLABLE_TO_FROZEN,
             "sdk_version_is_frozen_tag": False,
             "exit_code": code,
             "tokens": {
