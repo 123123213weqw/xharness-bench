@@ -188,8 +188,26 @@ class DshUpstreamAgent(BaseAgent):
         # beside the package cache. uv needs neither ensurepip nor a package
         # manager, so provisioning stops depending on what the image happens to
         # contain.
+        # --offline first, and that is not an optimisation.
+        #
+        # The warmed cache is a bind mount and does contain the wheels, but uv still
+        # consults the index when the cached index response has aged out, so a run
+        # that should be entirely local goes to pypi.org and gives up:
+        #
+        #     error: Failed to fetch: `https://pypi.org/simple/deepseek-harness-sdk/`
+        #       Caused by: Request failed after 3 retries
+        #       Caused by: operation timed out
+        #
+        # That is intermittent -- it depends on how long ago the cache was written --
+        # which is worse than a consistent failure, because the arm it kills looks
+        # like a property of the harness. Seven of 47 trials in the second comparison
+        # run died this way, and whether they did was a function of cache age. With
+        # --offline the resolution is deterministic: it either finds the wheels or it
+        # does not, and it does not silently depend on the network being up.
         provision = (
             "uv venv --python 3.12 /opt/dsh-venv 2>&1 | tail -3; "
+            f"uv pip install --offline --python /opt/dsh-venv/bin/python "
+            f"{shlex.quote(spec)} 2>&1 | tail -8 || "
             f"uv pip install --python /opt/dsh-venv/bin/python {shlex.quote(spec)}"
             " 2>&1 | tail -8; "
             "/opt/dsh-venv/bin/python -c 'import deepseek_harness; "

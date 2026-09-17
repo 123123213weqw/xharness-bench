@@ -143,20 +143,25 @@ class XHarnessAgent(BaseAgent):
         base_url: str | None = DEFAULT_BASE_URL,
         # The host refuses to start without an explicit window whenever a model is
         # configured and no provider deployment file supplies the capability, so
-        # this cannot be left unset. The value is 128_000 to match what the upstream
-        # harness ships for the same model -- its runtime declares
-        # `contextWindow: 128e3` -- so that both arms are granted the same model
-        # capacity and a difference between them is not a difference in room.
+        # this cannot be left unset. The value must match what the upstream harness
+        # grants the same model, or the comparison measures the budget rather than
+        # the harness. Measured, both ways:
         #
-        # Neither number is the model's real limit. deepseek-v4-flash accepts at
-        # least 1_000_000 input tokens (measured: 1_000_031 accepted, no error), and
-        # the XHarness model profile itself declares
-        # `fallback_context_window_tokens: 1000000`. Pinning XHarness to its own
-        # profile value while upstream stays at 128e3 would hand one arm eight times
-        # the room, so the smaller of the two declared capacities is used instead,
-        # and the effective value each arm actually ran with is recorded per trial
-        # from its own `request/context` event.
-        context_window: int = 128000,
+        #   upstream dsh, shipped runtime config   contextWindow: 128e3 (declared)
+        #                                          but reports 1000000 effective
+        #   XHarness, own model profile            fallback_context_window_tokens 1000000
+        #   deepseek-v4-flash itself               >= 1,000,000 (1,000,031 accepted)
+        #
+        # The upstream arm was observed reporting effective_context_window 1000000 in
+        # the second comparison run, and a single trial there used 127,805 reasoning
+        # tokens -- more than a 131,072 window can hold. Pinning XHarness to 131,072
+        # while upstream ran at 1,000,000 handed one arm eight times the room and made
+        # every budget-limited turn look like a harness weakness. A controlled rerun
+        # of three such tasks, changing only the budget, went from 0/3 to 2/3.
+        #
+        # 4096 is the host default when this is unset, which is far too small to be
+        # neutral, so the value is always passed.
+        context_window: int = 1000000,
         max_output_tokens: int | None = None,
         extra_args: list[str] | None = None,
         turn_timeout_sec: int = 1800,

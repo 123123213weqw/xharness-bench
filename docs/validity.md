@@ -189,11 +189,47 @@ Both arms emit `request/context` carrying the `contextWindow` they actually ran
 with, so the effective value is now read back per trial instead of assumed from the
 flags. Assuming it is what produced this threat in the first place.
 
-**What is still not equalised.** XHarness reserves its output budget out of the
-window and the upstream reserve semantics are not documented anywhere reachable, so
-the two arms' *effective input* budgets are probably not identical even at the same
-declared window. This is reported rather than silently normalised: the effective
-numbers are in every result row, and any conclusion is stated against them.
+**The recording caught the inequality, which is the point of recording it.** Running
+both arms in the second comparison showed the two on different numbers:
+
+```
+xharness      effective_context_window 131072
+dsh-upstream  effective_context_window 1000000
+```
+
+and the consequences were not subtle. A single upstream trial
+(`largest-eigenval`) completed having used 127,805 reasoning tokens -- more than the
+entire window XHarness had been given -- while XHarness's own run of the same task
+ended at 42,155 with a budget failure. Only one of those two arms could finish that
+task, and the reason was the flag, not the harness.
+
+**A controlled rerun, changing nothing but the budget.** Three tasks that had failed
+on budget in the 47x2 run, run twice: once at `context_window=1000000,
+max_output_tokens=131072`, once at the `128000/32768` the main run used.
+
+| task | 1M / 131072 | 128K / 32768 |
+| --- | --- | --- |
+| `circuit-fibsqrt` | **pass**, 1801 s | `max-tokens`, 487 s |
+| `write-compressor` | **pass**, 274 s | `error`, 136 s |
+| `adaptive-rejection-sampler` | `completed`, 1127 s | `max-tokens`, 652 s |
+| | **2/3** | **0/3** |
+
+Same tasks, same model, same machine, same harness binary. The budget decided the
+outcome.
+
+**What is still not equalised.** The output-budget semantics differ and no reachable
+documentation settles them. `--max-output-tokens` is a reservation carved out of the
+context window; upstream's `max_tokens` bounds a single step. Both arms are given
+`1000000`/`32768`, which makes the declared window and the per-step ceiling match, so
+the effective input budgets (967,232 and roughly 967,232) agree to within the safety
+margin. This is measured per trial rather than assumed, and any conclusion is stated
+against the measured numbers.
+
+**The methodological point.** Both of these values were in a comment claiming they
+had been "verified against the shipped binary". Neither had been. A number that
+matters this much, written into an arm's configuration, is a measurement, and it
+should be taken the same way as any other measurement in the bench -- from the
+system, not from a note saying someone once looked.
 
 ## T15: the oracle gate and the comparison have different load profiles
 
