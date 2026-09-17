@@ -298,14 +298,31 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             reason = data.get("reason")
             if isinstance(reason, dict) and isinstance(reason.get("kind"), str):
                 reasons.append(reason["kind"])
-                # Failed carries the provider's own message:
-                #   TurnEndReason::Failed { error: String }
-                # Keeping only the kind discards the one field that says why, and a
-                # turn ending in "error" then looks identical whether the provider
-                # refused the request, the context overflowed, or the host broke --
-                # all of which are indistinguishable from a low score.
-                if isinstance(reason.get("error"), str) and reason["error"].strip():
-                    errors.append(f"{reason['kind']}: {reason['error'].strip()}")
+                # Failed carries the provider's own message, and the shape is not
+                # the one the Rust enum suggests. The host does not serialise
+                # TurnEndReason::Failed { error: String }; it builds the JSON by
+                # hand in driver.rs:
+                #     LoopStatus::Failed => json!({
+                #         "kind": "error",
+                #         "error": {"message": ..., "code": "LOOP_FAILED"},
+                #     }),
+                # so the kind is "error" rather than "failed", and the payload is a
+                # nested object rather than a string. Reading only the kind made a
+                # failing turn indistinguishable from a low score -- which is how
+                # four trials in the first comparison run ended with reason "error"
+                # and nothing whatsoever to explain them.
+                detail = reason.get("error")
+                if isinstance(detail, dict):
+                    message = str(detail.get("message") or "").strip()
+                    code = str(detail.get("code") or "").strip()
+                    if message or code:
+                        errors.append(
+                            f"{reason['kind']}: {message}"
+                            + (f" ({code})" if code else "")
+                        )
+                elif isinstance(detail, str) and detail.strip():
+                    # Defensive: also accept the flat shape.
+                    errors.append(f"{reason['kind']}: {detail.strip()}")
 
     return {
         "input_tokens": input_tokens,

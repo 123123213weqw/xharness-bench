@@ -161,6 +161,55 @@ class LocalEnvironment:
         shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
 
 
+def check_turn_error_shapes() -> list[tuple[str, bool]]:
+    """A failed turn must carry its reason, in either shape the host may emit.
+
+    The host does not serialise ``TurnEndReason::Failed { error: String }``. It
+    builds the JSON by hand (driver.rs), so a failed turn arrives as::
+
+        {"kind": "error", "error": {"message": ..., "code": "LOOP_FAILED"}}
+
+    -- a different kind *and* a nested object. Reading only ``kind`` is how four
+    trials in the first comparison run ended with reason "error" and nothing to
+    explain them, which is indistinguishable from a low score.
+    """
+    from xharness_bench.rpc import summarize_events
+
+    nested = summarize_events(
+        [
+            {
+                "type": "turn/end",
+                "data": {
+                    "turn": 0,
+                    "reason": {
+                        "kind": "error",
+                        "error": {"message": "provider refused", "code": "LOOP_FAILED"},
+                    },
+                },
+            }
+        ]
+    )
+    flat = summarize_events(
+        [{"type": "turn/end", "data": {"reason": {"kind": "failed", "error": "flat"}}}]
+    )
+    clean = summarize_events(
+        [{"type": "turn/end", "data": {"reason": {"kind": "completed"}}}]
+    )
+    truncated = summarize_events(
+        [{"type": "turn/end", "data": {"reason": {"kind": "max-tokens"}}}]
+    )
+    return [
+        ("failed turn keeps its message", nested["turn_end_errors"] == [
+            "error: provider refused (LOOP_FAILED)"
+        ]),
+        ("failed turn is not 'completed'", nested["turn_completed"] is False),
+        ("flat error shape also read", flat["turn_end_errors"] == ["failed: flat"]),
+        ("clean turn reports no errors", clean["turn_end_errors"] == []),
+        ("clean turn is 'completed'", clean["turn_completed"] is True),
+        ("truncation is visible", truncated["turn_end_reasons"] == ["max-tokens"]),
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-binary", type=Path, required=True)
@@ -181,6 +230,10 @@ def main(argv: list[str] | None = None) -> int:
         help="environment variable holding the credential, for --live",
     )
     args = parser.parse_args(argv)
+
+    # Pure parsing checks first: they need no host, no model and no container, and
+    # they cover the reason a failed turn is readable at all.
+    shape_results = check_turn_error_shapes()
 
     root = Path(tempfile.mkdtemp(prefix="xh-smoke-"))
     workspace = root / "ws"
@@ -249,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         checks = [
             ("turn reached a clean finish", meta.get("turn_completed") is True),
             ("turn/end reason recorded", meta.get("turn_end_reasons") == ["completed"]),
+        ("no spurious turn errors", meta.get("turn_end_errors") == []),
             ("final response captured", bool(meta.get("final_response"))),
             ("input tokens reported", (tokens.get("input_tokens") or 0) > 0),
             ("output tokens reported", (tokens.get("output_tokens") or 0) > 0),
@@ -277,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"metadata: {json.dumps(meta, ensure_ascii=False)[:400]}")
     print()
     failed = 0
-    for label, ok in checks:
+    for label, ok in shape_results + checks:
         print(f"  {'PASS' if ok else 'FAIL'}  {label}")
         failed += 0 if ok else 1
     print()
