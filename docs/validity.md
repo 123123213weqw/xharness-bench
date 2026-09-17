@@ -143,6 +143,32 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T17: provider transport failures are attributed to the harness
+
+Two of the upstream arm's 47 trials ended with
+
+```
+error: DeepSeek API request to https://api.deepseek.com failed (TRANSPORT)
+```
+
+which is the network, not the harness. The failure arrives as a turn-end reason of
+`error` from whichever arm was running, so a reader of the pass rates cannot tell a
+harness that failed from a request that never reached the provider. The upstream arm
+uses the operator's own proxy, and this is the same proxy path that has needed
+attention throughout (T6).
+
+These are not excluded from the reported rates -- they are counted, because excluding
+failures that happen to be environmental is how a benchmark flatters its subject. But
+they are counted *separately*, by their message, so the two effects can be told apart
+in the write-up. The 47x2 comparison cannot resolve an effect this small anyway
+(194 tasks are needed for a 10pp difference), so the honest use of these trials is as
+a qualitative note about the environment rather than as a term in either arm's rate.
+
+`turn_end_errors` exists because of this: a turn that ends in `error` and a turn that
+ends in `error` were indistinguishable in the first comparison run, and the reason was
+on the wire the whole time. Both this and the budget rejection above were invisible
+until that text was recorded.
+
 ## T16: the two harnesses do not mean the same thing by "context window"
 
 Reading the failure composition of the 47x2 run showed a clean threshold. Cumulative
@@ -202,6 +228,29 @@ and the consequences were not subtle. A single upstream trial
 entire window XHarness had been given -- while XHarness's own run of the same task
 ended at 42,155 with a budget failure. Only one of those two arms could finish that
 task, and the reason was the flag, not the harness.
+
+**The mechanism, in the host's own words.** Re-running two of the tasks that had
+ended in `error`, at the same 131,072 window, with the error text now recorded:
+
+```
+error: token budget rejected request: estimated request input (104990 tokens) exceeds
+available input budget (97280); context=131072, output_reserve=32768,
+minimum_output=32768, safety_margin=1024; no further safe compaction was available
+(LOOP_FAILED)
+
+error: token budget rejected request: estimated request input (97842 tokens) exceeds
+available input budget (97280); context=131072, output_reserve=32768, ...
+```
+
+`cancel-async-tasks`, the third task in that group, passed on the rerun -- where the
+original run had recorded `error` -- so there is run-to-run variance on top of the
+budget effect, and a single trial per task does not settle a task's outcome either.
+
+The arithmetic is stated by the message: available input budget is
+`context - output_reserve - safety_margin` = 131072 - 32768 - 1024 = 97,280. One task
+missed by 562 tokens, 0.6% of the budget. Under a 1,000,000-token window and the same
+32,768 output reserve the budget is 967,232, and neither of those requests comes
+close to it.
 
 **A controlled rerun, changing nothing but the budget.** Three tasks that had failed
 on budget in the 47x2 run, run twice: once at `context_window=1000000,
