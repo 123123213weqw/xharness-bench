@@ -68,6 +68,7 @@ from harbor.models.agent.context import AgentContext
 
 from ..rpc import (
     RPC_SHIM,
+    fetch_history,
     ContainerRpcClient,
     TransportError,
     exec_parts,
@@ -522,8 +523,10 @@ class XHarnessAgent(BaseAgent):
         )
 
         started = time.monotonic()
-        history: dict[str, Any] = {}
         while time.monotonic() - started < self._turn_timeout_sec:
+            # Poll on the default page. It is the cheap call and all it has to
+            # answer is "has the turn ended yet" -- the tail always contains
+            # turn/end, which is the newest event.
             history = await client.call("session.history", {"sessionId": session_id})
             events = normalized_events(history)
             if any(event["type"] == "turn/end" for event in events):
@@ -532,8 +535,26 @@ class XHarnessAgent(BaseAgent):
         else:
             context.metadata = {**(context.metadata or {}), "timeout": True}
 
+        # Then read the whole run for accounting. The default page is the *last 50
+        # messages*, so summing tokens or counting tool calls from it measures the
+        # tail and calls it the total: the previous run reported tool-call counts
+        # clustering at 48 to 50 across unrelated tasks, which looked like a step
+        # limit. There is no step limit; the adapter simply never asked for more
+        # than one page, and ignored the hasMore flag that said so.
+        tail_events = events
+        history = await fetch_history(client, session_id)
         events = normalized_events(history)
+        # Keep both counts in the row. It costs nothing and it is the difference
+        # between a number and an assumption: if these two ever agree for a long
+        # run, the paging is not being exercised, and if they differ, the size of
+        # the gap is the size of the error the un-paged version was reporting.
+        self._history_pages = {
+            "tail_events": len(tail_events),
+            "total_events": len(events),
+        }
         self._transcript = events
+        if getattr(self, "_history_pages", None):
+            context.metadata = {**(context.metadata or {}), **self._history_pages}
         self._populate_context(context, events, time.monotonic() - started)
 
         # When a turn ends in "error" the reason alone rarely says why -- the host

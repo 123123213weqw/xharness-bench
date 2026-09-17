@@ -199,6 +199,52 @@ class ContainerRpcClient:
         raise TransportError(f"host never became ready within {timeout:.0f}s: {last}")
 
 
+async def fetch_history(
+    client: "ContainerRpcClient",
+    session_id: str,
+    *,
+    page_messages: int = 500,
+    max_pages: int = 200,
+) -> dict[str, Any]:
+    """Read a session's complete history, following ``hasMore``.
+
+    ``session.history`` defaults to the last 50 *messages* and says so in the
+    response -- ``hasMore`` -- but the default is easy to mistake for the whole
+    thing, because the reply looks complete. It is not: the page starts partway
+    through the run, and everything built on it (token totals, tool-call counts)
+    silently describes only that tail.
+
+    That is exactly what happened here. The first comparison run called
+    ``session.history`` with no ``maxMessages``, took the 50-message default, and
+    reported tool-call counts that piled up at 48 to 50 -- which read as a step
+    limit and sent me looking for one in the host. The host has no step limit
+    (``max_steps: usize::MAX``); the adapter was just not asking for the rest.
+
+    ``page_messages`` is the server's own maximum (``MAX_HISTORY_MESSAGES`` = 500),
+    so a single request covers all but the longest runs; paging continues backwards
+    by ``beforeSeq`` when it does not.
+    """
+    events: list[dict[str, Any]] = []
+    before_seq: int | None = None
+    for _ in range(max_pages):
+        payload: dict[str, Any] = {"sessionId": session_id, "maxMessages": page_messages}
+        if before_seq is not None:
+            payload["beforeSeq"] = before_seq
+        page = await client.call("session.history", payload)
+        if not isinstance(page, dict):
+            break
+        batch = [e for e in (page.get("events") or []) if isinstance(e, dict)]
+        events = batch + events
+        if not page.get("hasMore"):
+            break
+        seqs = [e.get("seq") for e in batch if isinstance(e.get("seq"), int)]
+        if not seqs:
+            # hasMore with nothing to page from: stop rather than loop forever.
+            break
+        before_seq = min(seqs)
+    return {"events": events}
+
+
 def normalized_events(history: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten ``session.history`` into a list of typed session events."""
     events: list[dict[str, Any]] = []

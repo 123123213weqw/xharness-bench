@@ -143,6 +143,49 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T19: the adapter was measuring the last 50 messages and calling it the run
+
+The XHarness arm's tool-call counts clustered at 48 to 50 across unrelated tasks:
+
+```
+48 48 48 48 48 49 49 50 50 50 50 50 ...
+```
+
+which reads unmistakably as a step limit. The host has none -- `max_steps` is
+`usize::MAX` -- and an upstream trial in the same set ran to 248 tool calls, so the
+limit had to be on my side. It was:
+
+```python
+history = await client.call("session.history", {"sessionId": session_id})
+```
+
+`session.history` defaults to `DEFAULT_HISTORY_MESSAGES = 50` when `maxMessages` is
+absent, and returns `hasMore` to say the page is partial. The call above passed
+neither, and the reply is shaped like a complete history, so nothing about it looks
+truncated. Every number derived from it -- token totals, tool-call counts, turn
+reasons -- described the tail of the run and was reported as the whole of it.
+
+**Why the pass/fail verdicts survive.** The verifier grades the container, not the
+transcript, so the 26 passes and 21 failures in that arm are unaffected. What is
+wrong is everything in the right-hand columns, including the token table in T16.
+
+**Fix.** `fetch_history` pages backwards by `beforeSeq` until `hasMore` is false,
+using the server's own maximum of 500 messages per request so most runs need one.
+Polling still uses the default page -- it only has to answer "has `turn/end`
+appeared", and the newest event is always in the tail -- and the complete read
+happens once, at the end.
+
+**Evidence, not assertion.** Every row now carries both counts, `tail_events` and
+`total_events`. On a run shorter than 50 messages they are equal, which is what the
+smoke test asserts; on a long run the gap is exactly the error the un-paged version
+was reporting, measured rather than estimated. The regression test builds a
+120-step session against a stub that pages the way the server does and checks that
+the default page is truncated, that the complete read is not, and that ordering
+survives reassembly.
+
+Twice now the fix has been the same shape: ask the system what it did, instead of
+inferring it from a reply that happens to look complete.
+
 ## T18: the 32,768 output cap binds both arms, symmetrically
 
 The upstream arm hit it too. On `adaptive-rejection-sampler`:

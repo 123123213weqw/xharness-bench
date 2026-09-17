@@ -210,6 +210,86 @@ def check_turn_error_shapes() -> list[tuple[str, bool]]:
     ]
 
 
+class _PagedHistoryStub:
+    """Stands in for the host's ``session.history``, paging the way it really does.
+
+    The semantics are copied from the server rather than imagined: it walks backwards
+    until ``maxMessages`` *message* events (user, assistant, tool result) have been
+    counted, returns every event in that range, and reports ``hasMore``. The default
+    is 50 messages.
+    """
+
+    def __init__(self, events: list[dict[str, Any]], default_messages: int = 50) -> None:
+        self.events = events
+        self.default_messages = default_messages
+        self.calls: list[dict[str, Any]] = []
+
+    async def call(self, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        assert method == "session.history", method
+        payload = payload or {}
+        self.calls.append(dict(payload))
+        limit = int(payload.get("maxMessages") or self.default_messages)
+        end = int(payload.get("beforeSeq") or len(self.events))
+        end = min(end, len(self.events))
+        start, messages = end, 0
+        while start > 0 and messages < max(limit, 1):
+            start -= 1
+            if self.events[start]["type"] in ("user/message", "assistant/message", "tool/result"):
+                messages += 1
+        return {"events": self.events[start:end], "hasMore": start > 0}
+
+
+def _synthetic_events(steps: int) -> list[dict[str, Any]]:
+    """One user message, then ``steps`` assistant/tool-result pairs."""
+    events: list[dict[str, Any]] = [{"seq": 0, "type": "user/message", "data": {}}]
+    seq = 1
+    for step in range(steps):
+        events.append({"seq": seq, "type": "assistant/message", "data": {"step": step}})
+        seq += 1
+        events.append({"seq": seq, "type": "tool/result", "data": {"step": step}})
+        seq += 1
+    events.append({"seq": seq, "type": "turn/end", "data": {"reason": {"kind": "completed"}}})
+    return events
+
+
+def check_history_paging() -> list[tuple[str, bool]]:
+    """A long run must be read back whole, not as its last 50 messages.
+
+    The first comparison run reported tool-call counts clustering at 48 to 50 across
+    unrelated tasks, which reads as a step limit. The host has none -- max_steps is
+    usize::MAX -- but session.history defaults to the last 50 messages and says so
+    only through a hasMore flag the adapter was not reading.
+    """
+    import asyncio as _asyncio
+
+    from xharness_bench.rpc import fetch_history, normalized_events
+
+    events = _synthetic_events(120)
+    stub = _PagedHistoryStub(events)
+
+    default_page = _asyncio.run(stub.call("session.history", {"sessionId": "s"}))
+    complete = _asyncio.run(fetch_history(stub, "s"))
+
+    default_types = [e["type"] for e in default_page["events"]]
+    complete_types = [e["type"] for e in complete["events"]]
+    steps_default = default_types.count("assistant/message")
+    steps_complete = complete_types.count("assistant/message")
+
+    # Ordering must survive paging: events are prepended page by page.
+    seqs = [e["seq"] for e in complete["events"]]
+    return [
+        ("default page really is truncated", default_page["hasMore"] is True),
+        ("default page holds 50 messages", len(default_page["events"]) < len(events)),
+        ("default page covers about 25 steps", 20 <= steps_default <= 26),
+        ("complete read gets every event", len(complete["events"]) == len(events)),
+        ("complete read gets every step", steps_complete == 120),
+        ("events stay in sequence order", seqs == sorted(seqs)),
+        ("complete read survives normalization",
+         len(normalized_events(complete)) == len(events)),
+    ]
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-binary", type=Path, required=True)
@@ -233,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Pure parsing checks first: they need no host, no model and no container, and
     # they cover the reason a failed turn is readable at all.
-    shape_results = check_turn_error_shapes()
+    shape_results = check_turn_error_shapes() + check_history_paging()
 
     root = Path(tempfile.mkdtemp(prefix="xh-smoke-"))
     workspace = root / "ws"
