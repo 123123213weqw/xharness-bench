@@ -73,6 +73,11 @@ class Comparison:
     only_candidate: int = 0
     both_fail: int = 0
     skipped: list[str] = field(default_factory=list)
+    # Tasks where both arms produced a trial but at least one had no verifier
+    # verdict. Kept out of the contingency table rather than counted as a loss:
+    # bool(None) is False, so the obvious implementation quietly scores every
+    # unjudged trial as a failure for whichever arm failed to reach grading.
+    unjudged: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -98,6 +103,7 @@ class Comparison:
             "discordant": self.only_baseline + self.only_candidate,
             "p_value": round(mcnemar_exact(self.only_baseline, self.only_candidate), 4),
             "skipped": len(self.skipped),
+            "unjudged": len(self.unjudged),
         }
 
 
@@ -141,6 +147,11 @@ def classify(row: dict[str, Any], *, verifier_untouched: bool = True) -> str:
     if not verifier_untouched:
         return "verifier_rejected"
     meta = row.get("metadata") or {}
+    if row.get("passed") is None:
+        # No verifier verdict at all: setup failure, timeout before grading, or a
+        # harness exception. Named separately because it is not evidence about
+        # either the model or the task.
+        return "no_verdict"
     if row.get("passed"):
         return "passed"
     if meta.get("timeout"):
@@ -180,6 +191,9 @@ def compare(rows: Iterable[dict[str, Any]], baseline: str, candidate: str) -> Co
         left, right = by_harness.get(baseline), by_harness.get(candidate)
         if left is None or right is None:
             result.skipped.append(task_id)
+            continue
+        if left.get("passed") is None or right.get("passed") is None:
+            result.unjudged.append(task_id)
             continue
         lp, rp = bool(left.get("passed")), bool(right.get("passed"))
         if lp and rp:
@@ -283,14 +297,22 @@ def row_from_trial(
 ) -> dict[str, Any] | None:
     """Map one Harbor trial onto this repository's flat result row.
 
-    A missing reward yields ``None`` -- "no result" -- never a failure. Inferring
-    a loss from an absent field would invent data, which is the one error that
-    would corrupt a paired comparison; a missing row is at least visible as an
-    unpaired task.
+    A missing reward is kept as a row with ``passed=None`` -- neither a pass nor a
+    failure. Inferring a loss from an absent field would invent data, which is the
+    one error that would corrupt a paired comparison.
+
+    But the row is *kept*, and that matters more than it looks. Dropping it made a
+    wholly failed arm print as
+
+        parsed 28 trial rows across 1 harness(es)
+
+    with the other 47 trials simply absent -- "no data" where the truth was
+    "nothing started". An arm that never ran has to look different from an arm that
+    was never measured, so unjudged trials are counted, classified as
+    ``no_verdict``, and excluded from the pass-rate denominator rather than from the
+    report.
     """
     reward = _reward_of(trial)
-    if reward is None:
-        return None
 
     agent_result = trial.get("agent_result") if isinstance(trial.get("agent_result"), dict) else {}
     metadata = {
@@ -308,7 +330,8 @@ def row_from_trial(
     return {
         "task_id": task_id,
         "harness": harness,
-        "passed": reward >= 1.0,
+        # None, not False: an unjudged trial is not a loss.
+        "passed": None if reward is None else reward >= 1.0,
         "reward": reward,
         "n_input_tokens": int(_first(agent_result, "n_input_tokens", default=0) or 0),
         "n_output_tokens": int(_first(agent_result, "n_output_tokens", default=0) or 0),
@@ -394,16 +417,19 @@ def render(
     lines.append("-" * 72)
     for name in sorted(by_harness):
         group = by_harness[name]
-        passed = sum(1 for r in group if r["passed"])
+        judged = [r for r in group if r["passed"] is not None]
+        passed = sum(1 for r in judged if r["passed"])
         elapsed = sorted(
             r["metadata"].get("elapsed_sec")
-            for r in group
+            for r in judged
             if isinstance(r["metadata"].get("elapsed_sec"), (int, float))
         )
         median = f"{elapsed[len(elapsed) // 2]:.0f}" if elapsed else "-"
-        lines.append(
-            f"{name:<24}{_fmt_rate(passed, len(group)):<28}{len(group):>4}  {median:>7}"
-        )
+        rate = _fmt_rate(passed, len(judged))
+        if len(judged) != len(group):
+            # Make the shortfall unmissable next to the rate it is missing from.
+            rate += f" ({len(group) - len(judged)} unjudged)"
+        lines.append(f"{name:<24}{rate:<28}{len(group):>4}  {median:>7}")
 
     lines.append("")
     lines.append("failure classification (rule-based, mutually exclusive)")
@@ -434,6 +460,11 @@ def render(
             f"{comparison.only_candidate} only-{candidate})"
         )
         lines.append(f"  exact McNemar p   {summary['p_value']}")
+        if summary["unjudged"]:
+            lines.append(
+                f"  unjudged pairs    {summary['unjudged']} "
+                "(a trial existed but no verifier verdict: excluded, not scored)"
+            )
         if summary["skipped"]:
             lines.append(f"  skipped unpaired  {summary['skipped']}")
         lines.append("")
