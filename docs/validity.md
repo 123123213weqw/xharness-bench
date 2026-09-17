@@ -143,6 +143,53 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T22: a test written from the same assumption as the code certifies the assumption
+
+The tool measurement added for T21 was wrong for both arms, and the smoke test passed.
+
+The code read the tool name from the nested shape the Rust enum implies:
+
+```python
+call = data.get("call") if isinstance(data.get("call"), dict) else {}
+name = call.get("name")
+```
+
+The wire is flat and camelCase instead:
+
+```json
+{"type": "tool/call", "data": {"name": "bash", "callId": "xh-...", "arguments": "..."}}
+```
+
+So `tool_calls_by_name` came back empty, `tool_result_bytes` was 0, and the rendered
+trace printed `CALL ? None` and `result ? 0B` for every step -- the trace showed that a
+run had happened and nothing about what it did.
+
+The test did not catch it because the test built its events from the same belief:
+
+```python
+def call(idx, name): return {"type": "tool/call", "data": {"call": {"id": ..., "name": name}}}
+```
+
+Twelve assertions, all green, against input invented to match the parser. This is worse
+than having no test: it produced the evidence that the measurement worked.
+
+**Fix, in two parts.**
+
+1. Extraction moved into `tool_call_name` and `tool_result_text`, which accept both
+   shapes, and both the summary and the trace renderer call them -- one implementation
+   rather than two chances to drift.
+2. The test is built from `tests/fixtures/real-session-xharness.json`, an actual
+   80-event session captured from a trial, with its expected values *read off the
+   fixture* rather than chosen: 9 calls, all `bash`, 14,236 result bytes, largest 8,171,
+   10 provider calls, window 1,000,000. If the fixture were regenerated with a different
+   session those numbers would change, and the diff would say so.
+
+**The general rule this is the second instance of.** T19 was also a case of reading a
+structure and assuming its shape -- a reply that looked complete, a field that looked
+absent. The check that works is not a test of the parser but a captured sample of the
+thing being parsed. Where a real artifact can be committed, it should be, and the
+expectations should be read from it.
+
 ## T21: the tool-call counter was counting results as calls
 
 Every tool-call figure this repository has reported was about twice the truth. The

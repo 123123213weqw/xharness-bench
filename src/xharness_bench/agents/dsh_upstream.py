@@ -46,6 +46,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from ..rpc import exec_parts, summarize_events
+from ..trace import export_trace
 
 SDK_PACKAGE = "deepseek-harness-sdk"
 
@@ -394,13 +395,30 @@ class DshUpstreamAgent(BaseAgent):
         # Same parser as the XHarness adapter: the two emit identical events, so
         # sharing the implementation keeps a parsing difference from masquerading
         # as a harness difference.
-        summary = summarize_events(result.get("events") or [])
+        events = result.get("events") or []
+        summary = summarize_events(events)
 
         context.n_input_tokens = summary["input_tokens"]
         context.n_cache_tokens = summary["cache_read_tokens"] + summary["cache_write_tokens"]
         context.n_output_tokens = summary["output_tokens"]
+        # The driver already returns the whole event stream; before this it was summed
+        # and discarded, so a finished trial kept the counts and lost the account.
+        trace_record = await export_trace(
+            environment,
+            events,
+            label="dsh-upstream",
+            meta={
+                "arm": "dsh-upstream",
+                "sdk_version": self._resolved_version or self._sdk_version,
+                "frozen_tag": FROZEN_UPSTREAM_TAG,
+                "config_shape": self._resolved_version and result.get("config_shape"),
+                "max_tokens": self._max_tokens,
+                "elapsed_sec": result.get("elapsed_sec"),
+            },
+        )
         context.metadata = {
             **(context.metadata or {}),
+            "trace": trace_record,
             "elapsed_sec": result.get("elapsed_sec"),
             "final_response": result.get("final_response") or summary["final_response"],
             "turn_ok": result.get("ok"),

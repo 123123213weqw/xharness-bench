@@ -245,6 +245,67 @@ async def fetch_history(
     return {"events": events}
 
 
+def tool_call_name(data: dict[str, Any]) -> str:
+    """The invoked tool's name, from either shape the wire may use.
+
+    The two arms emit identical events, and the shape is *flat and camelCase*:
+
+        {"type": "tool/call", "data": {"name": "bash", "callId": "xh-...",
+                                       "arguments": "{\"command\": ...}"}}
+
+    The durable Rust enum (``ToolCall { call: ToolCall }``) nests the same fields under
+    ``call``, and it is tempting to code against that -- which is what this module did
+    first, so every tool name came back empty on both arms while a hand-written test
+    that happened to use the nested shape passed. Real captured events are the fixture
+    now; see tests/fixtures/.
+    """
+    for source in (data, data.get("call") if isinstance(data.get("call"), dict) else {}):
+        name = source.get("name") if isinstance(source, dict) else None
+        if isinstance(name, str) and name:
+            return name
+    return ""
+
+
+def tool_result_text(data: dict[str, Any]) -> str:
+    """The text a tool handed back, from either shape.
+
+    The wire shape puts it in a message envelope:
+
+        {"message": {"content": [{"content": [{"text": "..."}]}]}}
+
+    so the text is two levels down, and both arms nest it the same way. The durable
+    shape (``{"result": {"content": "..."}}``) is accepted as a fallback.
+    """
+    result = data.get("result")
+    if isinstance(result, dict) and isinstance(result.get("content"), str):
+        return result["content"]
+
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        # Either the text sits directly on this part, or one level deeper inside a
+        # `content` list -- which is what both arms actually send.
+        inner = part.get("content")
+        if isinstance(inner, str):
+            parts.append(inner)
+        elif isinstance(inner, list):
+            for sub in inner:
+                if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                    parts.append(sub["text"])
+        elif isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    return "".join(parts)
+
+
 def normalized_events(history: dict[str, Any]) -> list[dict[str, Any]]:
     """Flatten ``session.history`` into a list of typed session events."""
     events: list[dict[str, Any]] = []
@@ -387,20 +448,17 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
         elif kind == "tool/call":
             tool_calls += 1
-            call = data.get("call") if isinstance(data.get("call"), dict) else {}
-            name = call.get("name")
-            if isinstance(name, str) and name:
+            name = tool_call_name(data)
+            if name:
                 tool_calls_by_name[name] = tool_calls_by_name.get(name, 0) + 1
         elif kind == "tool/result":
-            # Counted once, here. The blanket `tool/` branch below would double-count
-            # if it also matched, so results are handled explicitly.
-            result = data.get("result") if isinstance(data.get("result"), dict) else {}
-            content = result.get("content")
-            if isinstance(content, str):
-                size = len(content.encode("utf-8", errors="replace"))
-                tool_result_bytes += size
-                largest_tool_result_bytes = max(largest_tool_result_bytes, size)
-                tool_results += 1
+            # Counted once, here. A blanket `tool/` branch used to sit below and would
+            # double-count if it also matched, so results are handled explicitly.
+            content = tool_result_text(data)
+            size = len(content.encode("utf-8", errors="replace"))
+            tool_result_bytes += size
+            largest_tool_result_bytes = max(largest_tool_result_bytes, size)
+            tool_results += 1
         # No blanket ``tool/*`` branch. One existed and was wrong twice over: it counted
         # ``tool/result`` as a call, so a run making N calls reported about 2N, and it
         # counted ``tool/code-dispatch`` -- the runtime executing code, not the model

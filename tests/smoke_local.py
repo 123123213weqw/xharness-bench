@@ -348,24 +348,34 @@ def check_tool_breakdown() -> list[tuple[str, bool]]:
     def result(idx: int, content: str) -> dict:
         return {"type": "tool/result", "data": {"result": {"call_id": str(idx), "content": content}}}
 
-    events = [
-        call(1, "bash"), result(1, "x" * 100),
-        call(2, "bash"), result(2, "y" * 50),
-        call(3, "read_file"), result(3, "z" * 10),
-        # A dispatch event is neither a call nor a result; it must not be counted as a
-        # call, and the blanket branch that used to catch it is gone for that reason.
-        {"type": "tool/code-dispatch", "data": {}},
-    ]
-    summary = summarize_events(events)
+    # Assertions on a real captured session, not on a shape invented here.
+    #
+    # The first version of this test built `{"call": {"name": ...}}` events by hand --
+    # the shape the Rust enum implies -- and passed, while every tool name came back
+    # empty on both real arms, whose events are flat camelCase. A test written from the
+    # same assumption as the code cannot catch a wrong assumption; it certifies it. The
+    # fixture is a real 80-event session captured from a trial, and the expected numbers
+    # below were read off it, not chosen.
+    fixture = Path(__file__).resolve().parent / "fixtures" / "real-session-xharness.json"
+    if not fixture.exists():
+        return [("real session fixture is present", False)]
+    captured = json.loads(fixture.read_text(encoding="utf-8"))
+    summary = summarize_events(captured)
+
+    # A synthetic dispatch event, which is neither a call nor a result.
+    dispatch = summarize_events([{"type": "tool/code-dispatch", "data": {}}])
 
     return [
-        ("calls counted once, not per event", summary["tool_calls"] == 3),
-        ("results counted separately", summary["tool_results"] == 3),
-        ("every call has a name", sum(summary["tool_calls_by_name"].values()) == 3),
-        ("names are broken down", summary["tool_calls_by_name"] == {"bash": 2, "read_file": 1}),
-        ("distinct names counted", summary["tool_names_seen"] == 2),
-        ("result bytes summed", summary["tool_result_bytes"] == 160),
-        ("largest result recorded", summary["largest_tool_result_bytes"] == 100),
+        ("fixture parses", len(captured) == 80),
+        ("calls counted once, not per event", summary["tool_calls"] == 9),
+        ("results counted separately", summary["tool_results"] == 9),
+        ("real tool names recovered", summary["tool_calls_by_name"] == {"bash": 9}),
+        ("distinct names counted", summary["tool_names_seen"] == 1),
+        ("result bytes summed", summary["tool_result_bytes"] == 14236),
+        ("largest result recorded", summary["largest_tool_result_bytes"] == 8171),
+        ("provider calls counted", summary["provider_calls"] == 10),
+        ("context window read back", summary["effective_context_window"] == 1000000),
+        ("dispatch is not a call", dispatch["tool_calls"] == 0),
         ("no calls reports empty breakdown", summarize_events([])["tool_calls_by_name"] == {}),
         ("no calls reports zero bytes", summarize_events([])["tool_result_bytes"] == 0),
     ]

@@ -828,6 +828,39 @@ against a task image known to be minimal, not against a convenient one. Both smo
 tests had used images that happened to have what the adapters needed, which is
 exactly the case that proves nothing.
 
+## The trace was there the whole time
+
+Both adapters already held the complete session event stream and threw it away. The
+XHarness arm reads it back through `session.history`; the upstream driver prints it in
+its result JSON. Each kept the derived numbers and discarded the events, so a finished
+trial left behind token counts and tool-call counts and no account of what the model
+actually did -- the wrong way round, because the counts are the summary and the events
+are the evidence.
+
+Traces now land in `/logs/artifacts/<arm>/`, which Harbor injects as a conventional
+artifact source for every task and collects into `artifacts/logs/artifacts/` under the
+trial directory. Two files: `trace.txt`, one line per event with commands shown and tool
+output clipped, and `events.json`, the raw stream. Bounds are inline only; the raw file
+is complete.
+
+What the rendering is for, from a real captured session:
+
+```
+t0.s1    CALL      bash  command=ls -la /app/logs/ && echo "---" && ls /app/logs | wc -l ...
+t0.s1    result    bash 8171B  {"archive":{"bytes":21366,"format":"tool_result/v1",...
+t0.s2    assistant Now let me inspect the log line format and check a sample of severities.
+t0.s2    CALL      bash  command=head -3 /app/logs/2025-08-12_api.log; echo "==="; ...
+```
+
+That answers questions the counts cannot: how much of a 8,171-byte shell result was the
+model actually reading, whether it explored with `ls` before acting, whether a failure
+was a wrong command or a wrong conclusion. It is also the only way to diagnose a trial
+after the fact -- the container is gone, and re-running costs the same tokens again.
+
+A trace export never fails a trial. If the upload errors the record says so and the run
+continues; diagnostics that can turn a completed trial into a failed one are worse than
+no diagnostics.
+
 ## Harbor ignores a baked Dockerfile when `task.toml` names an image
 
 The single most expensive mistake in this project, because it was invisible.

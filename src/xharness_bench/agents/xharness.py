@@ -66,6 +66,7 @@ from harbor.agents.capabilities import AgentCapabilities
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from ..trace import export_trace
 from ..rpc import (
     RPC_SHIM,
     fetch_history,
@@ -556,6 +557,29 @@ class XHarnessAgent(BaseAgent):
         if getattr(self, "_history_pages", None):
             context.metadata = {**(context.metadata or {}), **self._history_pages}
         self._populate_context(context, events, time.monotonic() - started)
+
+        # Same events the summary above is derived from, written out in full. The
+        # summary answers "how much"; only the trace answers "what did it do", and a
+        # trial that ends unexpectedly cannot be re-run to find out. Placed after
+        # _populate_context so the version and host hash it records are the ones that
+        # were actually used rather than the ones requested.
+        meta_now = context.metadata or {}
+        trace_record = await export_trace(
+            environment,
+            events,
+            label="xharness",
+            meta={
+                "arm": "xharness",
+                "version": meta_now.get("xharness_version"),
+                "host_sha256": meta_now.get("xharness_host_sha256"),
+                "context_window": self._context_window,
+                "max_output_tokens": self._max_output_tokens,
+                "effective_window": meta_now.get("effective_context_window"),
+                "provider_calls": meta_now.get("provider_calls"),
+                "elapsed_sec": meta_now.get("elapsed_sec"),
+            },
+        )
+        context.metadata = {**meta_now, "trace": trace_record}
 
         # When a turn ends in "error" the reason alone rarely says why -- the host
         # log does. Attaching its tail costs one exec and turns an opaque zero into
