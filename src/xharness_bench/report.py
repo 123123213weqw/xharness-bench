@@ -163,6 +163,18 @@ def classify(row: dict[str, Any], *, verifier_untouched: bool = True) -> str:
         return "budget_exhausted"
     if meta.get("context_overflow"):
         return "context_overflow"
+    # A turn whose request the harness's own token budget refused never reached the
+    # task. Without this the message lands in turn_end_errors and the trial is
+    # classified no_progress, which reads as "the agent made no headway" for what is
+    # actually "the harness would not send the request" -- the difference between a
+    # finding about the model and a finding about the configuration.
+    joined_errors = " ".join(meta.get("turn_end_errors") or [])
+    if "token budget rejected request" in joined_errors:
+        return "budget_rejected"
+    if "TRANSPORT" in joined_errors:
+        return "transport_error"
+    if joined_errors:
+        return "harness_error"
     if meta.get("final_response") and not row.get("error"):
         return "declared_done_failed"
     if row.get("error"):
