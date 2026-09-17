@@ -599,6 +599,11 @@ class XHarnessAgent(BaseAgent):
             "first_prompt_tokens": summary.get("first_prompt_tokens"),
             "last_prompt_tokens": summary.get("last_prompt_tokens"),
             "provider_calls": summary.get("provider_calls"),
+            "tool_calls_by_name": summary.get("tool_calls_by_name"),
+            "tool_names_seen": summary.get("tool_names_seen"),
+            "tool_result_bytes": summary.get("tool_result_bytes"),
+            "largest_tool_result_bytes": summary.get("largest_tool_result_bytes"),
+            "tool_results": summary.get("tool_results"),
             # "completed" is the clean finish; anything else (e.g. "error") means
             # the harness itself failed, which is not evidence about the model or
             # the task.

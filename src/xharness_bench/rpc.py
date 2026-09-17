@@ -330,6 +330,18 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     # small first one indicts how conversation and tool output accumulate.
     #
     # Same events on both arms, so the measurement is shared rather than per-adapter.
+    # Per-tool breakdown, and the bytes each tool handed back.
+    #
+    # "Tool calls: 48" hides everything about what the run actually did. Two harnesses
+    # can reach the same count with completely different behaviour -- one probing with
+    # shell commands, one reading files -- and only the breakdown shows which. The byte
+    # total matters for a second reason: tool output is what gets re-sent on every
+    # later step, so it is the dominant term in context growth, not the model's own
+    # text. Cache reads exceeding fresh input by 20x is that effect, not a caching bug.
+    tool_calls_by_name: dict[str, int] = {}
+    tool_result_bytes = 0
+    largest_tool_result_bytes = 0
+    tool_results = 0
     first_prompt_tokens: int | None = None
     last_prompt_tokens: int | None = None
     provider_calls = 0
@@ -373,8 +385,26 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             if isinstance(message, dict):
                 answers.append(message_text(message))
 
-        elif isinstance(kind, str) and kind.startswith("tool/"):
+        elif kind == "tool/call":
             tool_calls += 1
+            call = data.get("call") if isinstance(data.get("call"), dict) else {}
+            name = call.get("name")
+            if isinstance(name, str) and name:
+                tool_calls_by_name[name] = tool_calls_by_name.get(name, 0) + 1
+        elif kind == "tool/result":
+            # Counted once, here. The blanket `tool/` branch below would double-count
+            # if it also matched, so results are handled explicitly.
+            result = data.get("result") if isinstance(data.get("result"), dict) else {}
+            content = result.get("content")
+            if isinstance(content, str):
+                size = len(content.encode("utf-8", errors="replace"))
+                tool_result_bytes += size
+                largest_tool_result_bytes = max(largest_tool_result_bytes, size)
+                tool_results += 1
+        # No blanket ``tool/*`` branch. One existed and was wrong twice over: it counted
+        # ``tool/result`` as a call, so a run making N calls reported about 2N, and it
+        # counted ``tool/code-dispatch`` -- the runtime executing code, not the model
+        # invoking a tool -- as one too. Only ``tool/call`` is a tool call.
 
         elif kind == "turn/end":
             reason = data.get("reason")
@@ -422,6 +452,17 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "first_prompt_tokens": first_prompt_tokens,
         "last_prompt_tokens": last_prompt_tokens,
         "provider_calls": provider_calls,
+        # Sorted by frequency, and capped: a session has a small fixed tool set, but a
+        # pathological run (or a future harness with dynamic tools) should not produce
+        # an unbounded result row. The cap is generous enough to be lossless in
+        # practice and the true distinct count is kept beside it.
+        "tool_calls_by_name": dict(
+            sorted(tool_calls_by_name.items(), key=lambda kv: (-kv[1], kv[0]))[:24]
+        ),
+        "tool_names_seen": len(tool_calls_by_name),
+        "tool_result_bytes": tool_result_bytes,
+        "largest_tool_result_bytes": largest_tool_result_bytes,
+        "tool_results": tool_results,
         # "completed" is the clean finish. Anything else means the harness itself
         # failed, which is not evidence about the model or the task.
         "turn_completed": "completed" in reasons,

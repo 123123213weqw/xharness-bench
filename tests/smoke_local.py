@@ -330,6 +330,48 @@ def check_prompt_size_tracking() -> list[tuple[str, bool]]:
 
 
 
+def check_tool_breakdown() -> list[tuple[str, bool]]:
+    """Tool calls counted once, broken down by name, and their output measured.
+
+    Two defects this guards against. The first is arithmetic: the counter matched every
+    event whose type starts with ``tool/``, which includes ``tool/result``, so a run
+    making N calls reported roughly 2N. Every tool-call figure reported before this was
+    measured that way. The second is that a bare count says nothing about what the run
+    did -- probing with shell commands and reading files reach the same total -- so the
+    breakdown by name and the bytes returned are the parts that answer the question.
+    """
+    from xharness_bench.rpc import summarize_events
+
+    def call(idx: int, name: str) -> dict:
+        return {"type": "tool/call", "data": {"call": {"id": str(idx), "name": name}}}
+
+    def result(idx: int, content: str) -> dict:
+        return {"type": "tool/result", "data": {"result": {"call_id": str(idx), "content": content}}}
+
+    events = [
+        call(1, "bash"), result(1, "x" * 100),
+        call(2, "bash"), result(2, "y" * 50),
+        call(3, "read_file"), result(3, "z" * 10),
+        # A dispatch event is neither a call nor a result; it must not be counted as a
+        # call, and the blanket branch that used to catch it is gone for that reason.
+        {"type": "tool/code-dispatch", "data": {}},
+    ]
+    summary = summarize_events(events)
+
+    return [
+        ("calls counted once, not per event", summary["tool_calls"] == 3),
+        ("results counted separately", summary["tool_results"] == 3),
+        ("every call has a name", sum(summary["tool_calls_by_name"].values()) == 3),
+        ("names are broken down", summary["tool_calls_by_name"] == {"bash": 2, "read_file": 1}),
+        ("distinct names counted", summary["tool_names_seen"] == 2),
+        ("result bytes summed", summary["tool_result_bytes"] == 160),
+        ("largest result recorded", summary["largest_tool_result_bytes"] == 100),
+        ("no calls reports empty breakdown", summarize_events([])["tool_calls_by_name"] == {}),
+        ("no calls reports zero bytes", summarize_events([])["tool_result_bytes"] == 0),
+    ]
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-binary", type=Path, required=True)
@@ -357,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
         check_turn_error_shapes()
         + check_history_paging()
         + check_prompt_size_tracking()
+        + check_tool_breakdown()
     )
 
     root = Path(tempfile.mkdtemp(prefix="xh-smoke-"))

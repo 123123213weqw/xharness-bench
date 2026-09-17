@@ -143,6 +143,45 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T21: the tool-call counter was counting results as calls
+
+Every tool-call figure this repository has reported was about twice the truth. The
+counter matched any event whose type begins with `tool/`:
+
+```python
+elif isinstance(kind, str) and kind.startswith("tool/"):
+    tool_calls += 1
+```
+
+A tool invocation emits `tool/call` and then `tool/result`, so a run making N calls
+counted about 2N. `tool/code-dispatch` and `tool/code-dispatch-start` were caught too,
+and those are the runtime executing code rather than the model invoking a tool.
+
+This went unnoticed because the numbers looked plausible. It also compounded with T19:
+the 48-to-50 clustering that sent me looking for a step limit was 50 *events* per
+default history page, which is about 25 calls, counted twice. Two independent defects
+produced a number that looked like a round limit, and the host has no step limit at all.
+
+**Fix.** Only `tool/call` increments the counter; the blanket branch is gone. Rows now
+also carry the breakdown that answers the question the total was standing in for:
+
+```
+tool_calls_by_name          {"bash": 31, "read_file": 9, "apply_patch": 8}
+tool_names_seen             3
+tool_result_bytes           184320
+largest_tool_result_bytes   41200
+tool_results                48
+```
+
+A bare count cannot distinguish a run that probes with shell commands from one that
+reads files -- both reach the same total -- and it says nothing about context, where
+tool output is the dominant term because it is re-sent on every later step.
+
+**Consequence for prior numbers.** Tool-call counts reported before this commit,
+including in T19 and in the comparison write-ups, are inflated by roughly 2x and should
+not be compared against post-fix rows. Pass rates are unaffected: the verifier grades
+the container, not the transcript.
+
 ## T20: the comparison ran against a revision the reader will assume is current
 
 The bench names its arms `xharness` and `dsh-upstream`. Neither name carries a

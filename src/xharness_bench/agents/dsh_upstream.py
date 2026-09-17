@@ -413,6 +413,11 @@ class DshUpstreamAgent(BaseAgent):
             "first_prompt_tokens": summary.get("first_prompt_tokens"),
             "last_prompt_tokens": summary.get("last_prompt_tokens"),
             "provider_calls": summary.get("provider_calls"),
+            "tool_calls_by_name": summary.get("tool_calls_by_name"),
+            "tool_names_seen": summary.get("tool_names_seen"),
+            "tool_result_bytes": summary.get("tool_result_bytes"),
+            "largest_tool_result_bytes": summary.get("largest_tool_result_bytes"),
+            "tool_results": summary.get("tool_results"),
             "turn_completed": summary["turn_completed"],
             "tool_calls": summary["tool_calls"],
             # Recorded so a result row always says which upstream it measured.
