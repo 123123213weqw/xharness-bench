@@ -21,25 +21,38 @@
 | 臂 | 版本 | 通过 | 未判定 |
 | --- | --- | ---: | ---: |
 | XHarness | 0.2.19（复刻 `dsh-v0.1.0-rc.8`） | 35/47 = 74.5% | 0 |
-| 上游 | SDK `0.1.0rc7` | 28/37 = 75.7% | 10 |
+| 上游 | SDK `0.1.0rc7` | 34/43 = 79.1% | 4 |
 
-Wilson 95% 置信区间：XHarness `[60.5%, 84.7%]`，上游 `[59.9%, 86.6%]` —— **几乎完全重叠**。
+Wilson 95% 置信区间：XHarness `[60.5%, 84.7%]`，上游 `[64.8%, 88.6%]` —— **大面积重叠**。
 
-### 配对（两臂都有判定的 37 题）
+上游那 10 个原本"未判定"的 trial，7 个是装包超时（已修 `--offline`），补跑后 6 个通过
+—— 它们之前被算作失败，实际上从未运行过。补跑结果覆盖旧记录。
+
+### 配对（两臂都被判定的 43 题）
 
 | | 题数 |
 | --- | ---: |
-| 都通过 | 26 |
+| 都通过 | 31 |
 | 都失败 | 6 |
 | 只有 XHarness 通过 | 3 |
-| 只有上游通过 | 2 |
+| 只有上游通过 | 3 |
 
-不一致 5 对 → **p = 1.0000**。
+**3 比 3，完全对称。不一致 6 对 → p = 1.0000。**
 
-XHarness 独有的 3 题：`extract-elf`、`kv-store-grpc`、`torch-tensor-parallelism`
-上游独有的 2 题：`cancel-async-tasks`、`llm-inference-batching-scheduler`
+XHarness 独有：`extract-elf`、`kv-store-grpc`、`torch-tensor-parallelism`
+上游独有：`cancel-async-tasks`、`dna-insert`、`llm-inference-batching-scheduler`
 
-5 对不一致里，任何一题的翻转都会改变"谁赢"的叙述方向。这就是 p = 1 的含义。
+不一致里任意一题翻转，"谁赢"的叙述方向就变。这就是 p = 1 的含义 ——
+不是"两者相同"，而是**这个规模无法区分**。
+
+数字可用 `scripts/compare.py` 复现：
+
+```bash
+scripts/compare.py \
+  --arm xharness-1M=runs/tier-a3-xharness \
+  --arm upstream=runs/tier-a2-dsh --arm upstream=runs/tier-a2-dsh-retry \
+  --baseline upstream --candidate xharness-1M
+```
 
 ---
 
@@ -47,12 +60,15 @@ XHarness 独有的 3 题：`extract-elf`、`kv-store-grpc`、`torch-tensor-paral
 
 ### 耗时：XHarness 慢约 2.4 倍
 
-| 臂 | 中位 | 均值 | 最长 | 合计 |
-| --- | ---: | ---: | ---: | ---: |
-| XHarness | 470 s | 526 s | 1802 s | 6.9 h |
-| 上游 | 195 s | 386 s | 1556 s | 4.0 h |
+| 臂 | 中位 | 最长 |
+| --- | ---: | ---: |
+| XHarness | 470 s | 1802 s |
+| 上游 | 224 s | 1556 s |
 
-这个差异**不依赖统计检验**：中位数差 2.4 倍，样本 37 对，远超噪声。
+这个差异**不依赖统计检验**：中位数差 2.1 倍，样本 43 对，远超噪声。
+
+**注意**：两臂都被 1,800 秒的 agent 上限截断（见 T25），所以"最长"那一列是上限而不是
+实际需要的时间。`extract-moves-from-video` 两边都撞到它。
 
 ### 提示词规模：XHarness 每步更重，但步数更少
 
