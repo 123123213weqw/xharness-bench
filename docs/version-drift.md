@@ -79,4 +79,23 @@ packages/api/settings-controller
 2. 单步上限、上下文窗口这些参数是按 rc.7 / rc.8 的行为测出来的（见 T16、T18）。
 3. 若要回答"该用哪个"，需要一条跑**当前上游**的臂。`0.1.5rc1` 已可从 PyPI 获取，uv 缓存也已预热，容器内可离线安装；适配器通过 `inspect.signature` 自适应 Config 变化（rc7 用 `session_root`，0.1.5 用 `dsh_home`），所以加这条臂不需要改适配器。
 
-**尚未做**：拿 0.1.5rc1 或 0.1.6-alpha.1 实际跑一轮。在那之前，任何"XHarness 对官方"的结论都只对 rc.7 成立。
+## 已验证：适配器能驱动最新 SDK
+
+跑了一题（`fix-git`，`--ak sdk_version=0.1.5rc1`）：
+
+```
+异常        : None
+config_shape: dsh_home          ← rc7 是 session_root，适配器自动适应
+reasons     : ['completed']     工具: 156   秒: 237
+sdk_version : 0.1.5rc1
+```
+
+容器内从预热缓存离线安装了 `deepseek_harness_sdk-0.1.5rc1` 与 `deepseek_harness_runtime_bin-0.1.5rc1`。
+
+结论：**加一条当前上游的臂不需要改适配器**，配置签名是运行时 introspect 的（rc7 `session_root` → 0.1.5 `dsh_home`）。
+
+**但这一个 trial 不说明两版谁强。** 同一题 rc.7 臂 32 次调用 40 秒通过，0.1.5rc1 这次 156 次调用 237 秒未通过。可能是版本行为差异（提示词、工具面、压缩策略都动过），也可能只是跑次间波动 —— 单题单次分不出来，要跑满一套才知道。
+
+## 尚未做
+
+拿 0.1.5rc1 或 0.1.6-alpha.1 跑满一轮。在那之前，任何"XHarness 对官方"的结论都只对 rc.7 成立。
