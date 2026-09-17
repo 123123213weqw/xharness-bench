@@ -78,11 +78,35 @@ lives here:
 
 ## Status
 
-Honest accounting of what has and has not been demonstrated is in
-[`docs/status.md`](docs/status.md). In short: the environment is provisioned and
-the interfaces are verified against the installed Harbor, but **no end-to-end
-Terminal-Bench trial has been run from this repository yet**. Treat the numbers
-this repository will eventually produce as pending, not as results.
+The paired comparison has run. Full write-up in [`docs/results.md`](docs/results.md);
+the headline is that **this task set cannot resolve the difference between the arms**:
+
+| arm | version | pass |
+| --- | --- | ---: |
+| XHarness | 0.2.19 (replica of `dsh-v0.1.0-rc.8`) | 35/47 = 74.5% |
+| upstream dsh | SDK `0.1.0rc7` | 34/43 = 79.1% |
+
+Paired over the 43 tasks both arms were graded on: 31 both pass, 6 both fail, 3 and 3 the
+other way. Discordant 6, exact McNemar **p = 1.0000**. 194 tasks would be needed to
+resolve a 10-point difference.
+
+What the same data does support is cost, which is not subject to small-effect problems:
+XHarness's median trial is 470 s against upstream's 224 s, and its prompt per step is 2-3x
+larger on tasks both arms passed.
+
+Three things to know before reading any number here:
+
+- **It is about `0.1.0rc7`, which is sixteen tags old.** Upstream has since shipped
+  `dsh-v0.1.6-alpha.1` with breaking changes to the session format, the API surface and
+  the default provider protocol. See [`docs/version-drift.md`](docs/version-drift.md).
+- **86% of the tasks cannot discriminate** — 31 of 43 pass for both arms, 6 fail for both.
+  The effective sample is the 6 discordant pairs, not 43 tasks.
+- **26 validity threats were found and fixed along the way**, each of which had produced a
+  plausible-looking wrong number. They are enumerated in
+  [`docs/validity.md`](docs/validity.md). One of them (T26) favoured the replica, which is
+  noted there for the same reason as the rest.
+
+The environment is provisioned end to end; `docs/status.md` keeps the per-stage account.
 
 ## Quickstart
 
