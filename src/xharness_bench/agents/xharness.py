@@ -67,6 +67,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from ..rpc import (
+    RPC_SHIM,
     ContainerRpcClient,
     TransportError,
     exec_parts,
@@ -293,27 +294,66 @@ class XHarnessAgent(BaseAgent):
         result = await environment.exec(command, **kwargs)
         return exec_parts(result)
 
-    async def _ensure_curl(self, environment: BaseEnvironment) -> None:
-        """The RPC shim needs an HTTP client; minimal images ship none."""
-        code, _ = await self._exec(environment, "command -v curl >/dev/null 2>&1")
-        if code == 0:
-            return
-        installers = (
-            "apt-get update -qq && apt-get install -y -qq --no-install-recommends curl",
-            "apk add --no-cache curl",
-            "dnf install -y -q curl",
-            "yum install -y -q curl",
-        )
-        for installer in installers:
-            code, _ = await self._exec(environment, f"{installer} >/dev/null 2>&1")
+    # One shell snippet, one round trip. Prefers an interpreter over curl because
+    # a task image is far more likely to be able to run Python than to have curl:
+    # the baked images carry uv, and the managed CPython that uv resolves is
+    # bind-mounted next to the warmed package cache. The previous version tried
+    # apt/apk/dnf/yum to install curl, which fails on the many task images that
+    # ship none of those package managers -- 13 of 47 trials died there, reported
+    # only as "no HTTP client available".
+    _PICK_INTERPRETER = (
+        "for c in python3 python; do "
+        "p=$(command -v \"$c\" 2>/dev/null) || continue; "
+        "\"$p\" -c 'import urllib.request' >/dev/null 2>&1 && { echo \"$p\"; exit 0; }; "
+        "done; "
+        "if command -v uv >/dev/null 2>&1; then "
+        "for v in 3.12 3.13 3.11; do "
+        "p=$(uv python find \"$v\" 2>/dev/null) || continue; "
+        "[ -n \"$p\" ] && \"$p\" -c 'import urllib.request' >/dev/null 2>&1 && "
+        "{ echo \"$p\"; exit 0; }; "
+        "done; fi; "
+        "exit 1"
+    )
+
+    async def _ensure_http_client(self, environment: BaseEnvironment) -> str | None:
+        """Install the RPC shim and resolve the interpreter that will run it.
+
+        Returns the interpreter path, or ``None`` to fall back to curl.
+        """
+        code, out = await self._exec(environment, self._PICK_INTERPRETER)
+        interpreter = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if code != 0 or not interpreter:
+            # No interpreter anywhere. Fall back to curl if the image has it, and
+            # say plainly what is missing if it does not.
+            code, _ = await self._exec(environment, "command -v curl >/dev/null 2>&1")
             if code == 0:
-                break
-        code, _ = await self._exec(environment, "command -v curl >/dev/null 2>&1")
-        if code != 0:
+                self._rpc_python = None
+                return None
             raise RuntimeError(
-                "no HTTP client available in the task container and none could be "
-                "installed; the XHarness adapter needs curl to drive the host RPC"
+                "the task container has neither a usable Python interpreter nor "
+                "curl, so the XHarness adapter cannot drive the host RPC. Bake the "
+                "image with uv, or bind-mount a CPython toolchain."
             )
+
+        await self._write_rpc_shim(environment)
+        self._rpc_python = interpreter
+        return interpreter
+
+    async def _write_rpc_shim(self, environment: BaseEnvironment) -> None:
+        """Upload the stdlib-only RPC client, avoiding all shell quoting."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "rpc.py"
+            path.write_text(RPC_SHIM, encoding="utf-8")
+            await environment.upload_file(path, f"{INSTALL_DIR}/rpc.py")
+
+        code, out = await self._exec(
+            environment,
+            f"test -s {INSTALL_DIR}/rpc.py && echo ok",
+        )
+        if code != 0:
+            raise RuntimeError(f"could not install the RPC shim: {out[:300]}")
 
     @override
     async def setup(self, environment: BaseEnvironment) -> None:
@@ -331,7 +371,7 @@ class XHarnessAgent(BaseAgent):
         if code != 0:
             raise RuntimeError(f"failed to install xharness-host: {out[:400]}")
 
-        await self._ensure_curl(environment)
+        await self._ensure_http_client(environment)
 
     # --------------------------------------------------------------------- run
 
@@ -394,6 +434,8 @@ class XHarnessAgent(BaseAgent):
             exec_fn=lambda command: self._exec(environment, command),
             port=self._port,
             token=self._token,
+            python=self._rpc_python,
+            script=f"{INSTALL_DIR}/rpc.py",
         )
         await client.wait_ready()
         return client
@@ -518,6 +560,7 @@ class XHarnessAgent(BaseAgent):
             "elapsed_sec": round(elapsed, 3),
             "tool_calls": summary["tool_calls"],
             "turn_end_reasons": summary["turn_end_reasons"],
+            "turn_end_errors": summary.get("turn_end_errors") or [],
             # "completed" is the clean finish; anything else (e.g. "error") means
             # the harness itself failed, which is not evidence about the model or
             # the task.

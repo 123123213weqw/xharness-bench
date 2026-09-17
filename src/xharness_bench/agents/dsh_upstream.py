@@ -174,20 +174,45 @@ class DshUpstreamAgent(BaseAgent):
         spec = "deepseek-harness-sdk"
         version = self._sdk_version or NEAREST_INSTALLABLE_TO_FROZEN
         spec = f"{spec}=={version}"
-        code, out = await self._exec(
-            environment,
-            "command -v python3 >/dev/null 2>&1 || "
-            "(apt-get update -qq && apt-get install -y -qq --no-install-recommends "
-            "python3 python3-venv python3-pip) >/dev/null 2>&1; "
-            "python3 -m venv /opt/dsh-venv >/dev/null 2>&1; "
-            f"/opt/dsh-venv/bin/pip install --quiet --upgrade pip >/dev/null 2>&1; "
-            # --pre is mandatory: every published version of this SDK is a
-            # pre-release, and pip hides those by default.
-            f"/opt/dsh-venv/bin/pip install --quiet --pre {shlex.quote(spec)} 2>&1 | tail -5; "
-            "/opt/dsh-venv/bin/python -c 'import deepseek_harness, sys; "
-            "print(deepseek_harness.__file__)'",
-            timeout_sec=1800,
+        # Provision through uv, not `python3 -m venv` plus pip.
+        #
+        # The previous version guarded the install with
+        #     command -v python3 || apt-get install ... python3-venv
+        # which is wrong twice over: an image that has python3 without the venv
+        # module takes the first branch and then fails at `python3 -m venv`, and an
+        # image with neither python3 nor apt fails in the fallback. Most task images
+        # are that second case -- no python3, no curl, no apt -- so 42 of 47 trials
+        # died with
+        #     bash: /opt/dsh-venv/bin/pip: No such file or directory
+        # Those images do carry uv, however, and a managed CPython is bind-mounted
+        # beside the package cache. uv needs neither ensurepip nor a package
+        # manager, so provisioning stops depending on what the image happens to
+        # contain.
+        provision = (
+            "uv venv --python 3.12 /opt/dsh-venv 2>&1 | tail -3; "
+            f"uv pip install --python /opt/dsh-venv/bin/python {shlex.quote(spec)}"
+            " 2>&1 | tail -8; "
+            "/opt/dsh-venv/bin/python -c 'import deepseek_harness; "
+            "print(deepseek_harness.__file__)'"
         )
+        code, out = await self._exec(environment, provision, timeout_sec=1800)
+        if code != 0:
+            # Second attempt, for an image that predates the uv bake: plain pip, if
+            # the image can manage it at all.
+            legacy = (
+                "python3 -m venv /opt/dsh-venv >/dev/null 2>&1; "
+                f"/opt/dsh-venv/bin/pip install --quiet --pre {shlex.quote(spec)}"
+                " 2>&1 | tail -5; "
+                "/opt/dsh-venv/bin/python -c 'import deepseek_harness; "
+                "print(deepseek_harness.__file__)'"
+            )
+            code, legacy_out = await self._exec(environment, legacy, timeout_sec=1800)
+            if code != 0:
+                raise RuntimeError(
+                    f"failed to install the upstream SDK ({spec}). "
+                    f"The uv route said:\n{out[:500]}"
+                    f"\nand the plain-pip route said:\n{legacy_out[:500]}"
+                )
         if code != 0:
             raise RuntimeError(
                 f"failed to install the upstream SDK ({spec}); if the container has "
@@ -274,6 +299,7 @@ class DshUpstreamAgent(BaseAgent):
             "finish_reason": result.get("finish_reason"),
             "config_shape": result.get("config_shape"),
             "turn_end_reasons": summary["turn_end_reasons"],
+            "turn_end_errors": summary.get("turn_end_errors") or [],
             "turn_completed": summary["turn_completed"],
             "tool_calls": summary["tool_calls"],
             # Recorded so a result row always says which upstream it measured.

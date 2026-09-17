@@ -20,6 +20,7 @@ namespace.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 from typing import Any, Awaitable, Callable
 
@@ -33,6 +34,43 @@ class RpcError(RuntimeError):
 
 class TransportError(RuntimeError):
     """No usable answer came back (host down, curl missing, timeout)."""
+
+
+# Installed into the task container at setup time. Kept as stdlib-only Python so
+# the adapter does not need curl, apt, pip or any network: an interpreter is the
+# one thing every task image can be made to have, because the baked images carry
+# uv and a managed CPython is bind-mounted alongside the package cache.
+RPC_SHIM = '''import json, sys, urllib.request, urllib.error
+
+
+def main():
+    origin, method, token, timeout = (
+        sys.argv[1],
+        sys.argv[2],
+        sys.argv[3],
+        float(sys.argv[4]),
+    )
+    body = sys.stdin.buffer.read()
+    headers = {"content-type": "application/json"}
+    if token:
+        headers["x-xharness-desktop-token"] = token
+    request = urllib.request.Request(
+        f"{origin}/api/{method}", data=body, headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            sys.stdout.buffer.write(response.read())
+    except urllib.error.HTTPError as error:
+        # An HTTP error still carries the JSON envelope, so let the caller read it
+        # and decide. Exiting non-zero here would hide the host's own message.
+        sys.stdout.buffer.write(error.read())
+    except Exception as error:
+        print(f"transport: {type(error).__name__}: {error}", file=sys.stderr)
+        raise SystemExit(3)
+
+
+main()
+'''
 
 
 def exec_parts(result: Any) -> tuple[int, str]:
@@ -57,12 +95,19 @@ class ContainerRpcClient:
         port: int,
         token: str | None = None,
         label: str = "bench",
+        python: str | None = None,
+        script: str | None = None,
     ) -> None:
         self._exec = exec_fn
         self._port = port
         self._token = token
         self._label = label
         self._sequence = 0
+        # When both are set the transport runs RPC_SHIM under that interpreter.
+        # Otherwise it falls back to curl, which is what the adapter used first and
+        # what works on images that happen to ship curl.
+        self._python = python
+        self._script = script
 
     @property
     def origin(self) -> str:
@@ -84,25 +129,39 @@ class ContainerRpcClient:
             },
             ensure_ascii=False,
         )
-        parts = [
-            "curl",
-            "-sS",
-            "--max-time",
-            str(int(timeout)),
-            "-H",
-            shlex.quote("content-type: application/json"),
-        ]
-        if self._token:
-            parts += [
+        if self._python and self._script:
+            # Heredoc rather than argv: request/context payloads carry the whole
+            # conversation and can exceed the argument list limit, and a heredoc
+            # needs no escaping of the JSON at all. The delimiter is nonced so a
+            # payload line can never terminate it early.
+            nonce = f"XHARNESS_RPC_{self._sequence}_{os.urandom(4).hex()}"
+            command = (
+                f"{shlex.quote(self._python)} {shlex.quote(self._script)} "
+                f"{shlex.quote(self.origin)} {shlex.quote(method)} "
+                f"{shlex.quote(self._token or '')} {int(timeout)}"
+                f" <<'{nonce}'\n{envelope}\n{nonce}"
+            )
+        else:
+            parts = [
+                "curl",
+                "-sS",
+                "--max-time",
+                str(int(timeout)),
                 "-H",
-                shlex.quote(f"x-xharness-desktop-token: {self._token}"),
+                shlex.quote("content-type: application/json"),
             ]
-        parts += [
-            "--data-binary",
-            shlex.quote(envelope),
-            shlex.quote(f"{self.origin}/api/{method}"),
-        ]
-        code, out = await self._exec(" ".join(parts))
+            if self._token:
+                parts += [
+                    "-H",
+                    shlex.quote(f"x-xharness-desktop-token: {self._token}"),
+                ]
+            parts += [
+                "--data-binary",
+                shlex.quote(envelope),
+                shlex.quote(f"{self.origin}/api/{method}"),
+            ]
+            command = " ".join(parts)
+        code, out = await self._exec(command)
         if code != 0 or not out.strip():
             raise TransportError(
                 f"RPC {method} produced no response (exit {code}): {out[:400]!r}"
@@ -211,6 +270,7 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     tool_calls = 0
     answers: list[str] = []
     reasons: list[str] = []
+    errors: list[str] = []
 
     for event in events:
         kind = event.get("type")
@@ -238,6 +298,14 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             reason = data.get("reason")
             if isinstance(reason, dict) and isinstance(reason.get("kind"), str):
                 reasons.append(reason["kind"])
+                # Failed carries the provider's own message:
+                #   TurnEndReason::Failed { error: String }
+                # Keeping only the kind discards the one field that says why, and a
+                # turn ending in "error" then looks identical whether the provider
+                # refused the request, the context overflowed, or the host broke --
+                # all of which are indistinguishable from a low score.
+                if isinstance(reason.get("error"), str) and reason["error"].strip():
+                    errors.append(f"{reason['kind']}: {reason['error'].strip()}")
 
     return {
         "input_tokens": input_tokens,
@@ -249,6 +317,8 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens_reported": total_reported,
         "tool_calls": tool_calls,
         "turn_end_reasons": reasons,
+        # The provider's own message for any turn that ended in "failed".
+        "turn_end_errors": errors,
         # "completed" is the clean finish. Anything else means the harness itself
         # failed, which is not evidence about the model or the task.
         "turn_completed": "completed" in reasons,
