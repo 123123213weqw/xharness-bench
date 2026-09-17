@@ -143,6 +143,45 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T20: the comparison ran against a revision the reader will assume is current
+
+The bench names its arms `xharness` and `dsh-upstream`. Neither name carries a
+version, and the second one in particular invites the reading "the official harness"
+-- present tense, as of today. What actually ran was SDK 0.1.0rc7, published
+2026-08-17, which is **one tag older than the contract XHarness replicates**
+(`dsh-v0.1.0-rc.8`, 2026-08-19) and 16 tags behind upstream's current
+`dsh-v0.1.6-alpha.1` (2026-09-15).
+
+rc.7 was not a careless choice. rc.8 was never published to PyPI, so the adapter's
+"nearest installable version" rule lands on rc.7, and the frozen and installed
+revisions are probably contract-equivalent -- the delta audit of 2026-08-21 found the
+fixed RPC name set unchanged from rc.8 to 0.1.1-rc.2. That makes the pairing a fair
+test of *replica fidelity*.
+
+It is not a test of *current competitive standing*, and nothing in the output said so.
+The register's own rule applies: a number has to carry its conditions. Failure
+classification was added for this reason, so was effective_context_window, so was
+turn_end_errors. The version is the same kind of omission.
+
+**Fix.** Every result row now carries the version that produced it, and the pass-rate
+table prints it beside the harness name:
+
+```
+harness (version)                 pass rate [95% CI]             n    med s
+--------------------------------------------------------------------------
+dsh-upstream (0.1.0rc7)            76.9% [57.9,89.0] (10 unjudged)  36        -
+xharness (0.2.19)                  55.3% [41.2,68.6]            47        -
+```
+
+Versions are collected per arm rather than picked, so an arm that ran two revisions
+shows both instead of looking like one that ran a single one.
+
+**What would close it.** An arm against the current upstream. `0.1.5rc1` is the latest
+PyPI release and installs offline from the warmed cache; the adapter introspects the
+SDK config signature (rc7 uses `session_root`, 0.1.5 uses `dsh_home`), so no adapter
+change is needed. Until that runs, every conclusion in this repository is a statement
+about rc.7 and is written that way.
+
 ## T19: the adapter was measuring the last 50 messages and calling it the run
 
 The XHarness arm's tool-call counts clustered at 48 to 50 across unrelated tasks:

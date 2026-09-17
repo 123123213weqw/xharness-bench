@@ -327,13 +327,20 @@ def row_from_trial(
     reward = _reward_of(trial)
 
     agent_result = trial.get("agent_result") if isinstance(trial.get("agent_result"), dict) else {}
+    nested = agent_result.get("metadata") if isinstance(agent_result.get("metadata"), dict) else {}
     metadata = {
         "timeout": bool(_first(trial, "timeout", default=False)),
         "final_response": _first(agent_result, "final_response", "output", default=""),
         "turn_end_reasons": _first(agent_result, "turn_end_reasons", default=[]),
         "elapsed_sec": _first(agent_result, "elapsed_sec", default=_first(trial, "elapsed_sec")),
         "tool_calls": _first(agent_result, "tool_calls"),
-        "xharness_version": _first(agent_result, "xharness_version"),
+        "xharness_version": _first(agent_result, "xharness_version", default=_first(nested, "xharness_version")),
+        # Which upstream revision this arm actually ran. A pass rate without it is
+        # the same defect as a timing without its conditions: 55.3% against a harness
+        # from four weeks ago and 55.3% against today's are different claims, and the
+        # difference is invisible unless the number carries its version.
+        "sdk_version": _first(nested, "sdk_version"),
+        "frozen_tag": _first(nested, "frozen_tag"),
         "xharness_host_sha256": _first(agent_result, "xharness_host_sha256"),
     }
     exception = trial.get("exception_info")
@@ -342,6 +349,7 @@ def row_from_trial(
     return {
         "task_id": task_id,
         "harness": harness,
+        "version": (metadata.get("xharness_version") or metadata.get("sdk_version")),
         # None, not False: an unjudged trial is not a loss.
         "passed": None if reward is None else reward >= 1.0,
         "reward": reward,
@@ -425,8 +433,8 @@ def render(
 
     lines.append(f"parsed {len(rows)} trial rows across {len(by_harness)} harness(es)")
     lines.append("")
-    lines.append(f"{'harness':<24}{'pass rate [95% CI]':<28}{'n':>4}  {'med s':>7}")
-    lines.append("-" * 72)
+    lines.append(f"{'harness (version)':<34}{'pass rate [95% CI]':<28}{'n':>4}  {'med s':>7}")
+    lines.append("-" * 82)
     for name in sorted(by_harness):
         group = by_harness[name]
         judged = [r for r in group if r["passed"] is not None]
@@ -441,7 +449,12 @@ def render(
         if len(judged) != len(group):
             # Make the shortfall unmissable next to the rate it is missing from.
             rate += f" ({len(group) - len(judged)} unjudged)"
-        lines.append(f"{name:<24}{rate:<28}{len(group):>4}  {median:>7}")
+        # The version travels with the name. Versions seen in one arm are listed
+        # together rather than picked: an arm that ran two revisions must not look
+        # like one that ran a single one.
+        versions = sorted({str(r.get("version")) for r in group if r.get("version")})
+        label = name if not versions else f"{name} ({', '.join(versions)})"
+        lines.append(f"{label:<34}{rate:<28}{len(group):>4}  {median:>7}")
 
     lines.append("")
     lines.append("failure classification (rule-based, mutually exclusive)")
