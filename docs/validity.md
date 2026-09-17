@@ -143,6 +143,34 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T26: the 1,800-second cap does not bind the arms equally
+
+T25 recorded the cap as symmetric because both adapters enforce it. The retry batch shows
+that being bound by the same limit is not the same as being affected by it equally.
+
+`compile-compcert`:
+
+```
+xharness   1623.6 s  194 tool calls  completed  PASS
+upstream   1800.0 s  Command timed out           no verdict
+```
+
+XHarness finished 176 seconds under the cap. Upstream was still working when it hit. One
+task in this set separates the arms *because of the limit* rather than because of anything
+about the harnesses -- and it is counted, in the final table, as a task only XHarness could
+do.
+
+Three more upstream trials have no verdict for the same reason (`gpt2-codegolf`,
+`extract-moves-from-video`, and `compile-compcert` above), against none for XHarness:
+upstream runs longer per task by construction, so a wall-clock cap is a thumb on the
+scale. It is the mechanism behind part of the 2.1x median difference, and it means the
+upstream arm's 79.1% is a floor rather than a measurement.
+
+**This is the one defect in the register that favoured the replica.** Every other entry
+depressed both arms or hit XHarness harder. It is recorded here in the same place and the
+same form as the rest, because a validity register that only lists the errors pointing one
+way is not a validity register.
+
 ## T25: `--agent-timeout-multiplier` never applied, because both adapters cap earlier
 
 Both adapters carry `turn_timeout_sec: int = 1800` and enforce it themselves. Harbor's
