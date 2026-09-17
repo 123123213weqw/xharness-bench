@@ -290,6 +290,46 @@ def check_history_paging() -> list[tuple[str, bool]]:
 
 
 
+def check_prompt_size_tracking() -> list[tuple[str, bool]]:
+    """Per-step prompt size must be reported, because totals do not explain totals.
+
+    An arm that spends more tokens spent them either across more steps or inside bigger
+    steps, and the fixes differ. first_prompt_tokens separates the two: a large first
+    step means the system prompt and tool surface are the cost, a small first step with
+    a large last one means accumulation during the run.
+    """
+    from xharness_bench.rpc import summarize_events
+
+    def step(prompt: int, cached: int, out: int = 10) -> dict:
+        return {
+            "type": "assistant/message",
+            "data": {
+                "usage": {
+                    "inputTokens": prompt,
+                    "cacheReadTokens": cached,
+                    "outputTokens": out,
+                }
+            },
+        }
+
+    # Three calls whose prompt grows, the way a real conversation does.
+    events = [step(1000, 0), step(200, 800), step(300, 1700)]
+    summary = summarize_events(events)
+    empty = summarize_events([])
+
+    return [
+        ("first prompt recorded", summary["first_prompt_tokens"] == 1000),
+        ("last prompt recorded", summary["last_prompt_tokens"] == 2000),
+        ("prompt includes cache reads", summary["last_prompt_tokens"] == 300 + 1700),
+        ("provider calls counted", summary["provider_calls"] == 3),
+        ("prompt total is the sum", summary["input_tokens"] == 1500),
+        ("cache total is the sum", summary["cache_read_tokens"] == 2500),
+        ("no calls reports None", empty["first_prompt_tokens"] is None),
+        ("no calls counts zero", empty["provider_calls"] == 0),
+    ]
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-binary", type=Path, required=True)
@@ -313,7 +353,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Pure parsing checks first: they need no host, no model and no container, and
     # they cover the reason a failed turn is readable at all.
-    shape_results = check_turn_error_shapes() + check_history_paging()
+    shape_results = (
+        check_turn_error_shapes()
+        + check_history_paging()
+        + check_prompt_size_tracking()
+    )
 
     root = Path(tempfile.mkdtemp(prefix="xh-smoke-"))
     workspace = root / "ws"

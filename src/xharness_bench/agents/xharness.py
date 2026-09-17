@@ -596,6 +596,9 @@ class XHarnessAgent(BaseAgent):
             "turn_end_reasons": summary["turn_end_reasons"],
             "turn_end_errors": summary.get("turn_end_errors") or [],
             "effective_context_window": summary.get("effective_context_window"),
+            "first_prompt_tokens": summary.get("first_prompt_tokens"),
+            "last_prompt_tokens": summary.get("last_prompt_tokens"),
+            "provider_calls": summary.get("provider_calls"),
             # "completed" is the clean finish; anything else (e.g. "error") means
             # the harness itself failed, which is not evidence about the model or
             # the task.

@@ -321,6 +321,18 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     # narrow the value it is given. Recording the effective number is the only way a
     # reader can tell whether the arms were granted comparable room.
     effective_context_window: int | None = None
+    # Prompt size at the first and last provider call, and how many calls there were.
+    #
+    # Total tokens say an arm spent more; they do not say why. The two candidates are
+    # "it took more steps" and "each step carried a bigger prompt", and they call for
+    # different fixes. These three numbers separate them: a first step that is already
+    # large indicts the system prompt and tool surface, while a large last step with a
+    # small first one indicts how conversation and tool output accumulate.
+    #
+    # Same events on both arms, so the measurement is shared rather than per-adapter.
+    first_prompt_tokens: int | None = None
+    last_prompt_tokens: int | None = None
+    provider_calls = 0
     answers: list[str] = []
     reasons: list[str] = []
     errors: list[str] = []
@@ -339,6 +351,18 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         if kind in ("assistant/message", "message/assistant"):
             usage = data.get("usage")
             if isinstance(usage, dict):
+                # Prompt of this one call. inputTokens excludes cache reads on both
+                # sides, so the three dimensions are summed, not picked.
+                step_prompt = (
+                    _usage_number(usage, "inputTokens", "input_tokens")
+                    + _usage_number(usage, "cacheReadTokens", "cache_read_tokens")
+                    + _usage_number(usage, "cacheWriteTokens", "cache_write_tokens")
+                )
+                if step_prompt:
+                    provider_calls += 1
+                    if first_prompt_tokens is None:
+                        first_prompt_tokens = step_prompt
+                    last_prompt_tokens = step_prompt
                 input_tokens += _usage_number(usage, "inputTokens", "input_tokens")
                 output_tokens += _usage_number(usage, "outputTokens", "output_tokens")
                 cache_read += _usage_number(usage, "cacheReadTokens", "cache_read_tokens")
@@ -395,6 +419,9 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         # The provider's own message for any turn that ended in "failed".
         "turn_end_errors": errors,
         "effective_context_window": effective_context_window,
+        "first_prompt_tokens": first_prompt_tokens,
+        "last_prompt_tokens": last_prompt_tokens,
+        "provider_calls": provider_calls,
         # "completed" is the clean finish. Anything else means the harness itself
         # failed, which is not evidence about the model or the task.
         "turn_completed": "completed" in reasons,
