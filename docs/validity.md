@@ -143,6 +143,28 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T25: `--agent-timeout-multiplier` never applied, because both adapters cap earlier
+
+Both adapters carry `turn_timeout_sec: int = 1800` and enforce it themselves. Harbor's
+`--agent-timeout-multiplier 4` scales Harbor's own limit, which the adapters never reach,
+so the effective cap on an agent turn was 1,800 seconds regardless of the flag.
+
+`extract-moves-from-video` is where it shows. Both arms die at the cap and neither is
+recorded as a timeout by the adapter:
+
+```
+xharness  1801.8 s  reasons []          (loop exited on the wall clock, no turn/end)
+upstream  1800.0 s  Command timed out after 1800 seconds
+```
+
+Symmetric, so it is a bound rather than a bias -- the same shape as T18. It does mean
+every task needing more than half an hour of agent time is scored as a failure for both
+arms, and the `-4` on the command line did nothing. Raising it requires rerunning both
+arms, since a cap that binds one and not the other is worse than one that binds both.
+
+Worth noting how it was found: not by reading the flag, but by asking why a task failed
+in both arms at suspiciously round numbers.
+
 ## T24: the verifier needs network, and its absence is not visible in the result
 
 Task verifiers run `apt-get install` before their tests. In 62 trials across both arms the
