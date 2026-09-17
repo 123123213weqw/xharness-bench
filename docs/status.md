@@ -32,6 +32,20 @@ optimistic.
 | The upstream SDK version matching `dsh-v0.1.0-rc.8` exists on PyPI | the Tier A upstream arm cannot be installed; resolve before running |
 | Terminal-Bench task images reach a package mirror | `setup()` would fail; a task set with vendored dependencies avoids this |
 
+## Tier A, attempt 1: void
+
+The first 47x2 run completed and wrote a full set of results, and the results are
+not usable. 19 of 94 trials got as far as the agent; the other 75 died in setup
+because both adapters assumed the task image would supply a runtime. One arm
+reported 0% and the other 46%, and neither number is about the harness.
+
+Kept as `runs/_void-tier-a-*`, because the failure mode is worth being able to point
+at: 94 result files, a job summary, sensible-looking pass rates, and no agent
+execution behind most of them.
+
+Attempt 2 is running with both setups rewritten to use the `uv` that every baked
+image carries, and with `--agent-setup-timeout-multiplier 4`.
+
 ## Gate result: 44/57 with zero harness-side failures
 
 Run on a quiet host, with the cache bind-mounted and every task baked:

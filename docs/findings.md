@@ -766,6 +766,68 @@ The measurements above ran on 57 of 89 images, which is enough to freeze a task
 list and run the comparison; completing the image set is deferred rather than
 paid for out of a metered allowance that would not survive it.
 
+## A 47x2 comparison run that measured the task images, not the harnesses
+
+The first full comparison produced 19 usable trials out of 94, and every loss was a
+setup failure:
+
+```
+xharness   13 x RuntimeError           no HTTP client available ... needs curl
+xharness    6 x AgentSetupTimeoutError Agent setup timed out after 360.0 seconds
+dsh        42 x RuntimeError           /opt/dsh-venv/bin/pip: No such file or directory
+dsh         5 x AgentSetupTimeoutError Agent setup timed out after 360.0 seconds
+```
+
+Both arms had assumed the task image would provide a runtime, and most task images
+provide nothing. Measured on one of the images that failed:
+
+```
+python3    无
+curl       无
+uv         /root/.local/bin/uv      <- baked in by prepare_tasks
+网络        172.17.0.1:7890 可连     <- the proxy was fine the whole time
+apt-get    absent
+```
+
+So the container had no interpreter, no HTTP client and no package manager, while
+the network was up. The adapter had been reporting "no HTTP client available" about
+a container that had no way to acquire one.
+
+**One root cause behind all four failure classes.** Both setup paths ended in
+`apt-get`, and on an image with no network or no apt, `apt-get update` does not fail
+fast -- it hangs until its own timeout. That is where the 11 `AgentSetupTimeoutError`
+trials went: the setup was not slow, it was blocked on an installer that could never
+succeed.
+
+**The fix is not a longer timeout, it is not needing the package manager.** Every
+baked image carries `uv`, and a managed CPython is bind-mounted beside the warmed
+package cache. So:
+
+* The XHarness RPC transport resolves an interpreter in one round trip -- `python3`,
+  then `python`, then `uv python find 3.12/3.13` -- and drives the host through a
+  stdlib-only shim uploaded into the container. Verified with `--network none`, and
+  end to end on `constraints-scheduling`, which had died with "no HTTP client
+  available" and now scores 1.0.
+* The dsh setup uses `uv venv --python 3.12` plus `uv pip install`, which needs
+  neither `ensurepip` nor a package manager. Verified on
+  `merge-diff-arc-agi-task`, one of the 42, which now scores 1.0 with 48 tool calls.
+
+The old code also had a subtler ordering bug: `command -v python3 || apt-get install
+... python3-venv` skips the install whenever python3 exists, so an image with
+python3 but without the venv module fails at `python3 -m venv` having never tried to
+fix it.
+
+**What this cost.** The run finished, wrote 94 result files and a job summary, and
+looked like a result: one arm at 46% and the other at 0%. Nothing in the aggregate
+said "the agents never started" -- that only appears if you read `exception_info`
+per trial. The comparison was measuring which task images happen to contain an HTTP
+client.
+
+**The check that would have caught it before the run.** Run one trial of each arm
+against a task image known to be minimal, not against a convenient one. Both smoke
+tests had used images that happened to have what the adapters needed, which is
+exactly the case that proves nothing.
+
 ## Harbor ignores a baked Dockerfile when `task.toml` names an image
 
 The single most expensive mistake in this project, because it was invisible.
