@@ -143,6 +143,43 @@ alongside anything else is measuring the host, not the harness.
    detection here needs the test name, not just the reward, so it is currently a
    manual step and is listed as such in `docs/status.md`.
 
+## T18: the 32,768 output cap binds both arms, symmetrically
+
+The upstream arm hit it too. On `adaptive-rejection-sampler`:
+
+```
+turn_end_reasons   ["max-tokens"]
+reasoning tokens   32786        cap 32768
+tool calls         10           elapsed 496 s
+```
+
+Eighteen tokens over. That trial died in a single step having barely started, and it
+is the only upstream failure in the run that is not either a wrong answer or a
+network error.
+
+So the cap the earlier run was pinned to suppresses both arms, in two different ways:
+
+* XHarness -- the value is a reservation carved out of the context window, so a
+  32,768 reserve against the 131,072 window that run used left 97,280 tokens of input
+  budget and rejected requests that needed 97,842;
+* upstream -- the value bounds a single step, so a step that wanted 32,786 tokens was
+  cut off at 32,768.
+
+For the comparison this is **symmetric and therefore not a validity threat in the way
+T14 was**: both arms are subject to the same per-step ceiling, so neither is favoured.
+It does depress both absolute scores, and the honest reading of any near-tie is that
+the cap may be hiding a difference rather than that there is none. It is recorded as
+a bound on the measurement, not as a correction to it.
+
+Raising it would require rerunning both arms, since a cap that binds one arm
+asymmetrically -- which is what a partial fix produces -- is worse than a cap that
+binds both. The current second-run configuration is 1,000,000 context and 32,768
+output for both arms, which equalises the input budget to within the safety margin at
+roughly 966,000 tokens and the per-step ceiling at exactly 32,768.
+
+The model's own output limit, measured, is 393,216 -- so the cap is 8% of what the
+provider would allow. That is the size of the residual.
+
 ## T17: provider transport failures are attributed to the harness
 
 Two of the upstream arm's 47 trials ended with
