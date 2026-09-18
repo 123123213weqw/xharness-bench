@@ -3,6 +3,11 @@
 What is verified, what is assumed, and what remains. Kept current rather than
 optimistic.
 
+**As of the last commit:** the paired comparison has run and is written up in
+[`docs/results.md`](docs/results.md). The sections below are the per-stage account of
+how the environment got there, void stages included. Where a present-tense sentence
+below conflicts with `results.md`, it is history rather than status.
+
 ## Verified
 
 | Claim | How |
@@ -43,8 +48,9 @@ Kept as `runs/_void-tier-a-*`, because the failure mode is worth being able to p
 at: 94 result files, a job summary, sensible-looking pass rates, and no agent
 execution behind most of them.
 
-Attempt 2 is running with both setups rewritten to use the `uv` that every baked
-image carries, and with `--agent-setup-timeout-multiplier 4`.
+Attempt 2 ran with both setups rewritten to use the `uv` that every baked image
+carries, and with `--agent-setup-timeout-multiplier 4`; it is the run written up in
+[`docs/results.md`](docs/results.md).
 
 ## Gate result: 44/57 with zero harness-side failures
 
@@ -167,17 +173,24 @@ shipped GUI's EGL failure on Mesa 26 has no bearing on these measurements.
 
 ## Not yet done
 
-1. **No Terminal-Bench trial by an adapter.** Harbor has been driven end to end,
-   `oracle` has been run against real tasks, and the adapter is verified against
-   the real host locally. What has never happened is an adapter completing a
-   *benchmark* trial -- which needs the oracle gate to pass first.
-3. **No task-hash freezing in the run loop.** `provenance.py` implements the
-   freeze/verify step and is tested, but nothing yet calls `verify()` from the
-   runner -- a run still has to be checked by hand.
-4. **No cost source.** `cost_usd` is plumbed through `AgentContext` but no price
-   table is wired up, so `cost_per_solved_task` cannot be computed yet.
-5. **`tasks/` is empty.** Held-out private tasks (countermeasure T3) are not
-   written.
+1. **Nothing calls `provenance.verify()` from the run loop.** The freeze/verify step
+   exists and is tested, but a run still has to be checked against the frozen plan by
+   hand.
+2. **No cost source.** `cost_usd` is plumbed through `AgentContext` but no price table
+   is wired up, so `cost_per_solved_task` cannot be computed yet.
+3. **`tasks/` is empty.** Held-out private tasks (countermeasure T3) are not written.
+4. **Three referenced artefacts are not in the repository**, because they are outputs of
+   a run on the reference host rather than source:
+
+   | Referenced by | Not present | Where it comes from |
+   | --- | --- | --- |
+   | `tests/smoke_local.py`, T22 | `tests/fixtures/real-session-xharness.json`, `real-session-durable.json` | `scripts/capture-fixtures.sh`, run on the host |
+   | `docs/results.md`, `scripts/oracle-control.sh` | `frozen/tier-a-plan.json` | `python -m xharness_bench.provenance --output frozen/tier-a-plan.json` |
+   | `scripts/oracle-control.sh`, T12 | `scripts/quiet-gate.sh` | written on the host while the gates ran and never committed; recover it from there, or rewrite it against the contract in T12 |
+
+   The first is deliberate and visible: with no fixture the shape checks report
+   `FAIL  real session fixture is present` rather than passing while measuring nothing.
+   This is also why a fresh clone's failure count is not the host's.
 
 ## First three commands to run
 

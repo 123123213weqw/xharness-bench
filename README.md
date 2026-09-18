@@ -226,6 +226,8 @@ src/xharness_bench/
   report.py               Wilson intervals, exact McNemar, failure taxonomy, aggregation CLI
   provenance.py           freeze the task list and interleave the run order
 configs/                  Tier A and Tier B run configurations
+scripts/                  the comparison, the controls, and the report CLIs
+tests/smoke_local.py      shape checks, run against captured artefacts rather than invented ones
 docs/validity.md          threats to validity and the countermeasures
 docs/findings.md          facts established while building this, with evidence
 docs/status.md            what is verified vs. still assumed
@@ -253,6 +255,21 @@ python -m xharness_bench.provenance \
 
 The digest is order-independent, so it detects tasks being *swapped*, not merely
 reordered. Schedule order is interleaved by construction (T2).
+
+## What is deliberately not committed
+
+Two of the things this repository measures against are *outputs* of a run on the
+reference host rather than source, so they are absent from a clean clone:
+
+- `tests/fixtures/` -- the two captured sessions the shape checks assert on.
+  `scripts/capture-fixtures.sh` re-captures both from the host.
+- `frozen/tier-a-plan.json` -- the frozen task list and its digest, written by the
+  command above before a run.
+
+That absence is visible rather than silent: with no fixture, `tests/smoke_local.py`
+reports `FAIL  real session fixture is present` instead of passing while measuring
+nothing. `scripts/quiet-gate.sh`, which `scripts/oracle-control.sh` calls to enforce
+T12, is in the same category and is listed in [`docs/status.md`](docs/status.md).
 
 ## License
 
